@@ -182,6 +182,7 @@ def _hpf_loss(p, freqs):
 #  BPF — Stub-loaded (parameterised order)
 # ═══════════════════════════════════════════════════════════════════════
 CHEBY_G7 = [1.0, 1.7372, 1.2583, 2.6381, 1.3444, 2.6381, 1.2583, 1.7372, 1.0]
+CHEBY_G9 = [1.0, 1.7504, 1.2690, 2.6678, 1.3673, 2.7239, 1.3673, 2.6678, 1.2690, 1.7504, 1.0]
 
 def _bpf_bounds(n):
     return [(n, 1e-3, 10e-3), (n, 1e-3, 10e-3), (n, 25., 120.), (n + 1, 0.01, 2.0)]
@@ -268,9 +269,10 @@ CU = "#c8882e"; CU_DARK = "#a06820"; SUBSTRATE = "#1a1a2e"
 VIA_C = "#ccb060"; SOLDER = "#d4d4d4"
 
 def _meander_pts(x0, y0, segs, bw):
+    """Meander trace from left edge pad to right edge pad."""
     x_min, x_max = EDGE_PAD, bw - EDGE_PAD
     x, y, dx = x0, y0, 1
-    pts = [(x, y)]
+    pts = [(0, y), (x, y)]
     for s in segs:
         left = s
         while left > 0.05:
@@ -280,6 +282,7 @@ def _meander_pts(x0, y0, segs, bw):
             x += step * dx; pts.append((x, y)); left -= step
             if left > 0.05:
                 y -= FOLD_GAP; pts.append((x, y)); dx = -dx
+    pts.append((bw, pts[-1][1]))
     return pts
 
 def _draw_trace(ax, pts, w, color=CU, z=3):
@@ -484,22 +487,22 @@ def main():
         freqs, fp, f_ghz, db, f1l, f1h, f2l, f2h)
     generated.extend(g1)
 
-    # Board 2: Steep rolloff (N=7, 0.15 guard)
+    # Board 2: Steep rolloff (N=9, 0.12 guard — very steep crossover)
     g2, s21b1_stp, s11b1_stp, s21b2_stp, s11b2_stp, bw2, bh2 = _design_board(
-        "Steep Rolloff (N=7)", "board_steep",
-        7, CHEBY_G7, 0.15, p_hpf, hpf_data,
+        "Steep Rolloff (N=9)", "board_steep",
+        9, CHEBY_G9, 0.12, p_hpf, hpf_data,
         freqs, fp, f_ghz, db, f1l, f1h, f2l, f2h)
     generated.extend(g2)
 
     # Comparison overlay
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    fig.suptitle("BPF Rolloff Comparison: Standard (N=5) vs Steep (N=7)", fontsize=13, fontweight="bold")
+    fig.suptitle("BPF Rolloff Comparison: Standard (N=5) vs Steep (N=9)", fontsize=13, fontweight="bold")
     for ax, s21_s, s21_st, title, vl in [
         (axes[0], s21b1_std, s21b1_stp, "BPF1 2.5-3.75 GHz", [2.5, 3.75]),
         (axes[1], s21b2_std, s21b2_stp, "BPF2 3.75-5.0 GHz", [3.75, 5.0]),
     ]:
         ax.plot(f_ghz, db(s21_s), "b", lw=1.5, label=f"N=5 ({bw1:.0f}×{bh1:.0f}mm)")
-        ax.plot(f_ghz, db(s21_st), "r", lw=1.5, label=f"N=7 steep ({bw2:.0f}×{bh2:.0f}mm)")
+        ax.plot(f_ghz, db(s21_st), "r", lw=1.5, label=f"N=9 steep ({bw2:.0f}×{bh2:.0f}mm)")
         ax.set_title(title); ax.set_xlabel("GHz"); ax.set_ylabel("|S21| [dB]")
         ax.set_ylim(-50, 3); ax.legend(fontsize=9); ax.grid(True, alpha=0.3)
         for fv in vl: ax.axvline(fv, color="gray", ls=":", lw=0.8)
@@ -507,7 +510,7 @@ def main():
     fig.savefig("board_rolloff_comparison.png", dpi=200); plt.close(fig)
     generated.append("board_rolloff_comparison.png")
 
-    # Stackup (shared)
+    # Stackup
     fig_s, ax_s = plt.subplots(figsize=(10, 5))
     ax_s.set_title("6-Layer Stackup", fontsize=13, fontweight="bold")
     stack = [
@@ -518,23 +521,89 @@ def main():
         ("L5 BPF2 stripline", 18e-6, "#9b59b6"), ("RO4450F er=3.52", H_SL, "#ecf0f1"),
         ("L6 Ground", 35e-6, "#27ae60"),
     ]
-    y = 0
+    y_s = 0
     for label_s, t, c in reversed(stack):
-        h = max(t*1e3, 0.015)
-        ax_s.add_patch(Rectangle((1,y),8,h,fc=c,ec="#333",lw=0.8))
-        ax_s.text(9.3, y+h/2, label_s, va="center", fontsize=8, fontfamily="monospace")
-        y += h
-    ax_s.set_xlim(0,20); ax_s.set_ylim(-0.02,y+0.04); ax_s.set_ylabel("mm"); ax_s.set_xticks([])
-    ax_s.text(5, y+0.025, f"Total: {TOTAL_H*1e3:.2f} mm", ha="center", fontsize=11, fontweight="bold")
+        h = max(t * 1e3, 0.015)
+        ax_s.add_patch(Rectangle((1, y_s), 8, h, fc=c, ec="#333", lw=0.8))
+        ax_s.text(9.3, y_s + h / 2, label_s, va="center", fontsize=8, fontfamily="monospace")
+        y_s += h
+    ax_s.set_xlim(0, 20); ax_s.set_ylim(-0.02, y_s + 0.04)
+    ax_s.set_ylabel("mm"); ax_s.set_xticks([])
+    ax_s.text(5, y_s + 0.025, f"Total: {TOTAL_H * 1e3:.2f} mm", ha="center", fontsize=11, fontweight="bold")
     fig_s.tight_layout(); fig_s.savefig("board_stackup.png", dpi=200); plt.close(fig_s)
     generated.append("board_stackup.png")
 
+    # ── Wave propagation GIFs (ABCD transfer-matrix field profile) ──
+    import matplotlib.animation as animation
+    from matplotlib.colors import TwoSlopeNorm
+
+    def _wave_gif(s21_bpf, label, fname, f_pass, f_stop):
+        """Animate EM wavefronts through a BPF using ABCD field profile."""
+        n_x = 300; n_frames = 40; fps = 10
+        x_mm = np.linspace(0, 20, n_x)
+
+        def _field(f_hz, s21_at_f):
+            s21_mag = float(np.abs(s21_at_f))
+            s11_mag = float(np.sqrt(max(1 - s21_mag ** 2, 0)))
+            beta = 2 * np.pi * f_hz * np.sqrt(ER_SL) / C0
+            fwd = np.exp(-1j * beta * x_mm * 1e-3)
+            bwd = s11_mag * np.exp(1j * beta * x_mm * 1e-3)
+            return fwd + bwd
+
+        s21_pass_idx = int(f_pass / 7e9 * len(s21_bpf))
+        s21_stop_idx = int(f_stop / 7e9 * len(s21_bpf))
+        s21_pass_val = s21_bpf[min(s21_pass_idx, len(s21_bpf) - 1)]
+        s21_stop_val = s21_bpf[min(s21_stop_idx, len(s21_bpf) - 1)]
+
+        V_pass = _field(f_pass, s21_pass_val)
+        V_stop = _field(f_stop, s21_stop_val)
+
+        fig_g, axes_g = plt.subplots(2, 1, figsize=(10, 4))
+        fig_g.suptitle(f"{label} — Wave Propagation", fontsize=12, fontweight="bold")
+
+        vmax = max(np.max(np.abs(np.real(V_pass))), np.max(np.abs(np.real(V_stop))), 0.1)
+
+        ims = []
+        for ax_g, title in zip(axes_g, [f"Passband {f_pass/1e9:.1f} GHz", f"Stopband {f_stop/1e9:.1f} GHz"]):
+            ax_g.set_xlim(x_mm[0], x_mm[-1]); ax_g.set_ylim(-vmax * 1.2, vmax * 1.2)
+            ax_g.set_ylabel(title, fontsize=8); ax_g.grid(True, alpha=0.2)
+            if ax_g == axes_g[-1]: ax_g.set_xlabel("Position [mm]")
+
+        line_p, = axes_g[0].plot([], [], "b", lw=1.5)
+        line_s, = axes_g[1].plot([], [], "r", lw=1.5)
+
+        def _update(frame):
+            t = frame / n_frames * (1 / f_pass)
+            omega_p = 2 * np.pi * f_pass
+            omega_s = 2 * np.pi * f_stop
+            line_p.set_data(x_mm, np.real(V_pass * np.exp(1j * omega_p * t)))
+            line_s.set_data(x_mm, np.real(V_stop * np.exp(1j * omega_s * t)))
+            return line_p, line_s
+
+        _update(0)
+        ani = animation.FuncAnimation(fig_g, _update, frames=n_frames, interval=1000 // fps, blit=True)
+        try:
+            ani.save(fname, writer=animation.PillowWriter(fps=fps))
+            print(f"  [saved] {fname}")
+        except Exception as e:
+            print(f"  GIF failed: {e}")
+            fname = None
+        plt.close(fig_g)
+        return fname
+
+    print("\n  Generating wave propagation GIFs...")
+    gf = _wave_gif(s21b1_std, "Standard BPF1 (N=5)", "board_standard_wave.gif", 3.1e9, 1.5e9)
+    if gf: generated.append(gf)
+    gf = _wave_gif(s21b1_stp, "Steep BPF1 (N=9)", "board_steep_wave.gif", 3.1e9, 1.5e9)
+    if gf: generated.append(gf)
+
     print("\n" + "=" * 64)
-    print("  OUTPUT IMAGES")
+    print("  OUTPUT FILES")
     print("=" * 64)
     for img in generated:
         sz = os.path.getsize(img) / 1024
-        print(f"  {img:40s}  {sz:6.0f} KB  OK")
+        ext = os.path.splitext(img)[1]
+        print(f"  {img:40s}  {sz:6.0f} KB  {ext}")
     print("=" * 64)
     print("  Complete.")
     print("=" * 64)
