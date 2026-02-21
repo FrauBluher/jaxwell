@@ -255,13 +255,21 @@ def _draw_gnd_pour(ax,bw,bh,voids=None):
         for (x,y,w,h) in voids:
             ax.add_patch(Rectangle((x,y),w,h,fc=SUBSTRATE,ec="#555",lw=0.2,zorder=2))
 
-def _draw_via_fence(ax,bw,bh):
+def _draw_via_fence(ax,bw,bh,exclusions=None):
+    """Draw perimeter ground via fence, skipping near signal pads."""
+    if exclusions is None:
+        exclusions = []
+    def _ok(x,y):
+        for ex,ey,er in exclusions:
+            if abs(x-ex)<er and abs(y-ey)<er:
+                return False
+        return True
     for x in np.arange(VIA_FENCE_PITCH, bw-0.5, VIA_FENCE_PITCH):
-        _draw_via(ax,x,0.5,0.25,0.1)
-        _draw_via(ax,x,bh-0.5,0.25,0.1)
+        if _ok(x,0.5): _draw_via(ax,x,0.5,0.25,0.1)
+        if _ok(x,bh-0.5): _draw_via(ax,x,bh-0.5,0.25,0.1)
     for y in np.arange(VIA_FENCE_PITCH, bh-0.5, VIA_FENCE_PITCH):
-        _draw_via(ax,0.5,y,0.25,0.1)
-        _draw_via(ax,bw-0.5,y,0.25,0.1)
+        if _ok(0.5,y): _draw_via(ax,0.5,y,0.25,0.1)
+        if _ok(bw-0.5,y): _draw_via(ax,bw-0.5,y,0.25,0.1)
 
 def _layer_ax(fig,pos,title,bw,bh):
     ax=fig.add_subplot(*pos)
@@ -314,19 +322,24 @@ def main():
     bpf2_total=float(np.sum(rl2))
 
     longest=max(hpf_total, bpf1_total, bpf2_total)
-    usable_run = longest  # total trace needs to fit with folds
 
     n_folds_needed = 1
-    trial_w = usable_run + 2*EDGE_PAD
+    trial_w = longest + 2*EDGE_PAD
     while trial_w > 40:
         n_folds_needed += 1
-        trial_w = usable_run / n_folds_needed + 2*EDGE_PAD
+        trial_w = longest / n_folds_needed + 2*EDGE_PAD
 
     board_w = np.ceil(trial_w)
-    board_h_trace = EDGE_PAD*2 + n_folds_needed * FOLD_GAP + 4
-    board_h = max(np.ceil(board_h_trace), board_w * 0.6)
-    board_h = max(board_h, 10)
-    board_w = max(board_w, board_h * 0.6)
+
+    max_stub_mm = float(np.max(sl)) * 1e3
+    board_h = np.ceil(
+        EDGE_PAD                          # top margin
+        + 1.0                             # trace to top clearance
+        + max_stub_mm + 1.0               # stub length + via pad
+        + n_folds_needed * FOLD_GAP       # meander folds
+        + EDGE_PAD                        # bottom margin
+    )
+    board_h = max(board_h, 6)
 
     BW = float(board_w)
     BH = float(board_h)
@@ -344,10 +357,10 @@ def main():
         hpf_segs.append(sl[k]*1e3)
     if len(ll)>3: hpf_segs.append(ll[3]*1e3)
 
-    y_start = BH - EDGE_PAD - 1
-    hpf_pts  = _meander_pts(EDGE_PAD, y_start, hpf_segs, BW)
-    bpf1_pts = _meander_pts(EDGE_PAD, y_start, list(rl1), BW)
-    bpf2_pts = _meander_pts(EDGE_PAD, y_start, list(rl2), BW)
+    y_feed = BH - EDGE_PAD - 1.0
+    hpf_pts  = _meander_pts(EDGE_PAD, y_feed, hpf_segs, BW)
+    bpf1_pts = _meander_pts(EDGE_PAD, y_feed, list(rl1), BW)
+    bpf2_pts = _meander_pts(EDGE_PAD, y_feed, list(rl2), BW)
 
     stub_w_mm=[float(_ms_width(jnp.array(float(sz[k]))))*1e3 for k in range(3)]
     mim_pads=[np.sqrt(float(cp[k])*H_CORE/(EPS0*ER_CORE))*1e3 for k in range(2)]
@@ -363,19 +376,25 @@ def main():
     fig.suptitle(f"SMT Filter Module — {BW:.0f} x {BH:.0f} mm  |  6-Layer Copper Artwork",
                  fontsize=14, fontweight="bold")
 
+    # Castellated signal pad positions — on left/right edges at feed y
+    pad_in  = (0, y_feed)
+    pad_out = (BW, y_feed)
+    # Exclusion zones: keep via fence away from signal pads (2mm radius)
+    excl = [(pad_in[0], pad_in[1], 2.0), (pad_out[0], pad_out[1], 2.0)]
+
     # L1 — HPF signal
     ax=_layer_ax(fig,(2,3,1),f"L1 — HPF Signal",BW,BH)
     _draw_trace(ax,hpf_pts,W50_MM)
     for k in range(3):
-        sx=stub_xs[k]; sy_end=y_start-sl[k]*1e3
-        _draw_trace(ax,[(sx,y_start),(sx,sy_end)],stub_w_mm[k],color="#d4a040")
+        sx=stub_xs[k]; sy_end=y_feed-sl[k]*1e3
+        _draw_trace(ax,[(sx,y_feed),(sx,sy_end)],stub_w_mm[k],color="#d4a040")
         _draw_via(ax,sx,sy_end-0.3)
     for k in range(2):
         cx=stub_xs[k]+(stub_xs[min(k+1,2)]-stub_xs[k])*0.5
         cx=min(max(cx,2),BW-2); ps=mim_pads[k]
-        ax.add_patch(Rectangle((cx-ps/2,y_start-ps/2),ps,ps,fc="#e8d080",ec=CU_DARK,lw=0.4,zorder=4))
-    _draw_castellated(ax,0,BH/2); _draw_castellated(ax,BW,BH/2)
-    _draw_via_fence(ax,BW,BH)
+        ax.add_patch(Rectangle((cx-ps/2,y_feed-ps/2),ps,ps,fc="#e8d080",ec=CU_DARK,lw=0.4,zorder=4))
+    _draw_castellated(ax,*pad_in); _draw_castellated(ax,*pad_out)
+    _draw_via_fence(ax,BW,BH,excl)
 
     # L2 — Ground
     ax=_layer_ax(fig,(2,3,2),f"L2 — Ground (HPF ref)",BW,BH)
@@ -383,11 +402,11 @@ def main():
     for k in range(2):
         cx=stub_xs[k]+(stub_xs[min(k+1,2)]-stub_xs[k])*0.5
         cx=min(max(cx,2),BW-2); ps=mim_pads[k]+0.3
-        voids.append((cx-ps/2,y_start-ps/2,ps,ps))
+        voids.append((cx-ps/2,y_feed-ps/2,ps,ps))
     for sx in stub_xs:
-        voids.append((sx-0.3,y_start-sl.max()*1e3-0.8,0.6,0.6))
-    _draw_gnd_pour(ax,BW,BH,voids); _draw_via_fence(ax,BW,BH)
-    _draw_castellated(ax,0,BH/2); _draw_castellated(ax,BW,BH/2)
+        voids.append((sx-0.3,y_feed-sl.max()*1e3-0.8,0.6,0.6))
+    _draw_gnd_pour(ax,BW,BH,voids); _draw_via_fence(ax,BW,BH,excl)
+    _draw_castellated(ax,*pad_in); _draw_castellated(ax,*pad_out)
 
     # L3 — BPF1 signal
     ax=_layer_ax(fig,(2,3,3),f"L3 — BPF1 (2.5-3.75 GHz)",BW,BH)
@@ -395,13 +414,13 @@ def main():
     for k in range(N_BPF):
         pt=bpf1_pts[min(k+1,len(bpf1_pts)-1)]
         ax.plot(pt[0],pt[1],"o",color="#e74c3c",ms=3,zorder=5)
-    _draw_via(ax,EDGE_PAD,y_start); _draw_via(ax,BW-EDGE_PAD,y_start)
-    _draw_via_fence(ax,BW,BH)
+    _draw_via(ax,EDGE_PAD,y_feed); _draw_via(ax,BW-EDGE_PAD,y_feed)
+    _draw_via_fence(ax,BW,BH,excl)
 
     # L4 — Ground
     ax=_layer_ax(fig,(2,3,4),f"L4 — Ground (shared)",BW,BH)
-    vc=[(EDGE_PAD-0.4,y_start-0.4,0.8,0.8),(BW-EDGE_PAD-0.4,y_start-0.4,0.8,0.8)]
-    _draw_gnd_pour(ax,BW,BH,vc); _draw_via_fence(ax,BW,BH)
+    vc=[(EDGE_PAD-0.4,y_feed-0.4,0.8,0.8),(BW-EDGE_PAD-0.4,y_feed-0.4,0.8,0.8)]
+    _draw_gnd_pour(ax,BW,BH,vc); _draw_via_fence(ax,BW,BH,excl)
 
     # L5 — BPF2 signal
     ax=_layer_ax(fig,(2,3,5),f"L5 — BPF2 (3.75-5.0 GHz)",BW,BH)
@@ -409,13 +428,13 @@ def main():
     for k in range(N_BPF):
         pt=bpf2_pts[min(k+1,len(bpf2_pts)-1)]
         ax.plot(pt[0],pt[1],"o",color="#e74c3c",ms=3,zorder=5)
-    _draw_via(ax,EDGE_PAD,y_start); _draw_via(ax,BW-EDGE_PAD,y_start)
-    _draw_via_fence(ax,BW,BH)
+    _draw_via(ax,EDGE_PAD,y_feed); _draw_via(ax,BW-EDGE_PAD,y_feed)
+    _draw_via_fence(ax,BW,BH,excl)
 
     # L6 — Ground
     ax=_layer_ax(fig,(2,3,6),f"L6 — Ground (bottom)",BW,BH)
-    _draw_gnd_pour(ax,BW,BH,vc); _draw_via_fence(ax,BW,BH)
-    _draw_castellated(ax,0,BH/2); _draw_castellated(ax,BW,BH/2)
+    _draw_gnd_pour(ax,BW,BH,vc); _draw_via_fence(ax,BW,BH,excl)
+    _draw_castellated(ax,*pad_in); _draw_castellated(ax,*pad_out)
 
     fig.tight_layout(rect=[0,0,1,0.95])
     fig.savefig("shape_copper_layers.png",dpi=200); plt.close(fig)
@@ -442,34 +461,34 @@ def main():
         if kind=="hpf":
             _draw_trace(ax_l,hpf_pts,W50_MM)
             for k in range(3):
-                sx=stub_xs[k]; se=y_start-sl[k]*1e3
-                _draw_trace(ax_l,[(sx,y_start),(sx,se)],stub_w_mm[k],color="#d4a040")
+                sx=stub_xs[k]; se=y_feed-sl[k]*1e3
+                _draw_trace(ax_l,[(sx,y_feed),(sx,se)],stub_w_mm[k],color="#d4a040")
                 _draw_via(ax_l,sx,se-0.3)
             for k in range(2):
                 cx=stub_xs[k]+(stub_xs[min(k+1,2)]-stub_xs[k])*0.5
                 cx=min(max(cx,2),BW-2); ps=mim_pads[k]
-                ax_l.add_patch(Rectangle((cx-ps/2,y_start-ps/2),ps,ps,fc="#e8d080",ec=CU_DARK,lw=0.4,zorder=4))
-            _draw_castellated(ax_l,0,BH/2); _draw_castellated(ax_l,BW,BH/2)
-            _draw_via_fence(ax_l,BW,BH)
+                ax_l.add_patch(Rectangle((cx-ps/2,y_feed-ps/2),ps,ps,fc="#e8d080",ec=CU_DARK,lw=0.4,zorder=4))
+            _draw_castellated(ax_l,*pad_in); _draw_castellated(ax_l,*pad_out)
+            _draw_via_fence(ax_l,BW,BH,excl)
         elif kind=="gnd_hpf":
-            _draw_gnd_pour(ax_l,BW,BH,voids); _draw_via_fence(ax_l,BW,BH)
-            _draw_castellated(ax_l,0,BH/2); _draw_castellated(ax_l,BW,BH/2)
+            _draw_gnd_pour(ax_l,BW,BH,voids); _draw_via_fence(ax_l,BW,BH,excl)
+            _draw_castellated(ax_l,*pad_in); _draw_castellated(ax_l,*pad_out)
         elif kind=="bpf1":
             _draw_trace(ax_l,bpf1_pts,SL_W50_MM,color="#3498db")
             for k in range(N_BPF):
                 pt=bpf1_pts[min(k+1,len(bpf1_pts)-1)]
                 ax_l.plot(pt[0],pt[1],"o",color="#e74c3c",ms=4,zorder=5)
-            _draw_via(ax_l,EDGE_PAD,y_start); _draw_via(ax_l,BW-EDGE_PAD,y_start)
-            _draw_via_fence(ax_l,BW,BH)
+            _draw_via(ax_l,EDGE_PAD,y_feed); _draw_via(ax_l,BW-EDGE_PAD,y_feed)
+            _draw_via_fence(ax_l,BW,BH,excl)
         elif kind=="bpf2":
             _draw_trace(ax_l,bpf2_pts,SL_W50_MM,color="#9b59b6")
             for k in range(N_BPF):
                 pt=bpf2_pts[min(k+1,len(bpf2_pts)-1)]
                 ax_l.plot(pt[0],pt[1],"o",color="#e74c3c",ms=4,zorder=5)
-            _draw_via(ax_l,EDGE_PAD,y_start); _draw_via(ax_l,BW-EDGE_PAD,y_start)
-            _draw_via_fence(ax_l,BW,BH)
+            _draw_via(ax_l,EDGE_PAD,y_feed); _draw_via(ax_l,BW-EDGE_PAD,y_feed)
+            _draw_via_fence(ax_l,BW,BH,excl)
         else:
-            _draw_gnd_pour(ax_l,BW,BH,vc); _draw_via_fence(ax_l,BW,BH)
+            _draw_gnd_pour(ax_l,BW,BH,vc); _draw_via_fence(ax_l,BW,BH,excl)
 
         fig_l.tight_layout()
         fig_l.savefig(fname,dpi=200); plt.close(fig_l)
