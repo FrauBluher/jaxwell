@@ -371,20 +371,42 @@ def _design_board(label, prefix, n_bpf, g_bpf, guard, p_hpf, hpf_data,
     y_b1 = y_hpf - ch_hpf - PAD_PITCH + 0.5
     y_b2 = y_b1 - ch_b1 - PAD_PITCH
 
-    hpf_segs = []
-    for k in range(3):
-        hpf_segs.append(ll[k] * 1e3 if k < len(ll) else 1)
-        hpf_segs.append(sl[k] * 1e3)
-    if len(ll) > 3: hpf_segs.append(ll[3] * 1e3)
-    hpf_pts = _meander_pts(EDGE_PAD, y_hpf, hpf_segs, BW)
+    # HPF feedline = only the 4 connecting lines (stubs are vertical branches)
+    hpf_line_segs = [ll[k] * 1e3 for k in range(len(ll))]
+    hpf_feed_total = sum(hpf_line_segs)
+    hpf_pts = _meander_pts(EDGE_PAD, y_hpf, hpf_line_segs, BW)
+
     bpf1_pts = _meander_pts(EDGE_PAD, y_b1, [t1 / (2 * n_bpf)] * (2 * n_bpf), BW)
     bpf2_pts = _meander_pts(EDGE_PAD, y_b2, [t2 / (2 * n_bpf)] * (2 * n_bpf), BW)
     stub_w_mm = [float(_ms_width(jnp.array(float(sz[k])))) * 1e3 for k in range(3)]
     mim_pads = [np.sqrt(float(cp[k]) * H_CORE / (EPS0 * ER_CORE)) * 1e3 for k in range(2)]
-    stub_xs = []; cum = EDGE_PAD
-    for k in range(3):
-        cum += hpf_segs[2 * k]; stub_xs.append(min(cum, BW - 2))
-        cum += hpf_segs[2 * k + 1] if 2 * k + 1 < len(hpf_segs) else 0
+
+    # Stub/cap positions along the HPF feedline
+    # Topology: Stub0 — ll[0] — Cap0 — ll[1] — Stub1 — ll[2] — Cap1 — ll[3] — Stub2
+    # Stubs at cumulative: 0, ll[0]+ll[1], ll[0]+ll[1]+ll[2]+ll[3]
+    # Caps at cumulative: ll[0], ll[0]+ll[1]+ll[2]
+    def _x_at_pathlen(pts, d_mm):
+        """Find (x,y) at distance d_mm along a polyline path."""
+        cum = 0
+        for i in range(len(pts) - 1):
+            seg = np.sqrt((pts[i+1][0]-pts[i][0])**2 + (pts[i+1][1]-pts[i][1])**2)
+            if cum + seg >= d_mm - 0.01:
+                frac = (d_mm - cum) / max(seg, 0.01)
+                frac = min(max(frac, 0), 1)
+                return (pts[i][0] + frac * (pts[i+1][0] - pts[i][0]),
+                        pts[i][1] + frac * (pts[i+1][1] - pts[i][1]))
+            cum += seg
+        return pts[-1]
+
+    stub_positions = [
+        _x_at_pathlen(hpf_pts, 0),
+        _x_at_pathlen(hpf_pts, (ll[0]+ll[1])*1e3),
+        _x_at_pathlen(hpf_pts, sum(hpf_line_segs)),
+    ]
+    cap_positions = [
+        _x_at_pathlen(hpf_pts, ll[0]*1e3),
+        _x_at_pathlen(hpf_pts, (ll[0]+ll[1]+ll[2])*1e3),
+    ]
 
     pads = [(0, BH-1, "G"), (0, y_hpf, "H"), (0, y_b1, "1"), (0, y_b2, "2"), (0, 1, "G"),
             (BW, BH-1, "G"), (BW, y_hpf, "H"), (BW, y_b1, "1"), (BW, y_b2, "2"), (BW, 1, "G")]
@@ -407,19 +429,21 @@ def _design_board(label, prefix, n_bpf, g_bpf, guard, p_hpf, hpf_data,
     ax = _layer_ax(fig, (2,3,1), "L1 HPF", BW, BH)
     _draw_trace(ax, hpf_pts, W50_MM)
     for k in range(3):
-        sx=stub_xs[k]; se=y_hpf-sl[k]*1e3
-        _draw_trace(ax, [(sx,y_hpf),(sx,se)], stub_w_mm[k], color="#d4a040")
-        _draw_via(ax, sx, se-0.3)
+        sx, sy = stub_positions[k]; se = sy - sl[k] * 1e3
+        _draw_trace(ax, [(sx, sy), (sx, se)], stub_w_mm[k], color="#d4a040")
+        _draw_via(ax, sx, se - 0.3)
     for k in range(2):
-        cx=stub_xs[k]+(stub_xs[min(k+1,2)]-stub_xs[k])*0.5; cx=min(max(cx,2),BW-2); ps=mim_pads[k]
-        ax.add_patch(Rectangle((cx-ps/2,y_hpf-ps/2),ps,ps,fc="#e8d080",ec=CU_DARK,lw=0.4,zorder=4))
+        cx, cy = cap_positions[k]; ps = mim_pads[k]
+        ax.add_patch(Rectangle((cx-ps/2, cy-ps/2), ps, ps, fc="#e8d080", ec=CU_DARK, lw=0.4, zorder=4))
     _pads(ax,"H"); _draw_via_fence(ax,BW,BH,excl)
     ax = _layer_ax(fig, (2,3,2), "L2 Ground", BW, BH)
     voids = list(gnd_voids)
     for k in range(2):
-        cx=stub_xs[k]+(stub_xs[min(k+1,2)]-stub_xs[k])*0.5; cx=min(max(cx,2),BW-2); ps=mim_pads[k]+0.3
-        voids.append((cx-ps/2,y_hpf-ps/2,ps,ps))
-    for sx in stub_xs: voids.append((sx-0.3,y_hpf-sl.max()*1e3-0.8,0.6,0.6))
+        cx, cy = cap_positions[k]; ps = mim_pads[k] + 0.3
+        voids.append((cx-ps/2, cy-ps/2, ps, ps))
+    for k in range(3):
+        sx, sy = stub_positions[k]
+        voids.append((sx-0.3, sy-sl[k]*1e3-0.8, 0.6, 0.6))
     _draw_gnd_pour(ax,BW,BH,voids); _draw_via_fence(ax,BW,BH,excl); _pads(ax)
     ax = _layer_ax(fig, (2,3,3), f"L3 BPF1 ({t1:.0f}mm)", BW, BH)
     _draw_trace(ax, bpf1_pts, SL_W50_MM, color="#3498db")
@@ -455,7 +479,7 @@ def _design_board(label, prefix, n_bpf, g_bpf, guard, p_hpf, hpf_data,
         s21d = db(s21); pb = (f_ghz>=vl[0])&(f_ghz<=vl[-1])
         if np.any(pb):
             print(f"  {name:5s} IL: {float(-np.max(s21d[pb])):.1f} - {float(-np.min(s21d[pb])):.1f} dB")
-    return generated, s21b1_np, s11b1_np, s21b2_np, s11b2_np, BW, BH
+    return generated, s21b1_np, s11b1_np, s21b2_np, s11b2_np, BW, BH, bpf1_pts
 
 
 def main():
@@ -481,14 +505,14 @@ def main():
     hpf_data = (sz, sl, cp, ll, s21h_np, s11h_np)
 
     # Board 1: Standard (N=5, 0.3 guard)
-    g1, s21b1_std, s11b1_std, s21b2_std, s11b2_std, bw1, bh1 = _design_board(
+    g1, s21b1_std, s11b1_std, s21b2_std, s11b2_std, bw1, bh1, b1pts1 = _design_board(
         "Standard (N=5)", "board_standard",
         5, CHEBY_G5, 0.3, p_hpf, hpf_data,
         freqs, fp, f_ghz, db, f1l, f1h, f2l, f2h)
     generated.extend(g1)
 
     # Board 2: Steep rolloff (N=9, 0.12 guard — very steep crossover)
-    g2, s21b1_stp, s11b1_stp, s21b2_stp, s11b2_stp, bw2, bh2 = _design_board(
+    g2, s21b1_stp, s11b1_stp, s21b2_stp, s11b2_stp, bw2, bh2, b1pts2 = _design_board(
         "Steep Rolloff (N=9)", "board_steep",
         9, CHEBY_G9, 0.12, p_hpf, hpf_data,
         freqs, fp, f_ghz, db, f1l, f1h, f2l, f2h)
@@ -533,55 +557,60 @@ def main():
     fig_s.tight_layout(); fig_s.savefig("board_stackup.png", dpi=200); plt.close(fig_s)
     generated.append("board_stackup.png")
 
-    # ── Wave propagation GIFs (ABCD transfer-matrix field profile) ──
+    # ── Wave propagation GIFs (2D board-layout wavefront animation) ──
     import matplotlib.animation as animation
-    from matplotlib.colors import TwoSlopeNorm
 
-    def _wave_gif(s21_bpf, label, fname, f_pass, f_stop):
-        """Animate EM wavefronts through a BPF using ABCD field profile."""
-        n_x = 300; n_frames = 40; fps = 10
-        x_mm = np.linspace(0, 20, n_x)
+    def _wave_gif_2d(bpf_pts, s21_bpf, label, fname, f_pass, f_stop, board_w, board_h):
+        """Animate wavefronts on the 2D board layout along the BPF trace."""
+        n_frames = 40; fps = 10
+        pts = np.array(bpf_pts)
+        seg_lens = np.sqrt(np.diff(pts[:,0])**2 + np.diff(pts[:,1])**2)
+        cum_len = np.concatenate([[0], np.cumsum(seg_lens)])
+        total_len = cum_len[-1]
+        n_pts = len(pts)
 
-        def _field(f_hz, s21_at_f):
-            s21_mag = float(np.abs(s21_at_f))
-            s11_mag = float(np.sqrt(max(1 - s21_mag ** 2, 0)))
-            beta = 2 * np.pi * f_hz * np.sqrt(ER_SL) / C0
-            fwd = np.exp(-1j * beta * x_mm * 1e-3)
-            bwd = s11_mag * np.exp(1j * beta * x_mm * 1e-3)
-            return fwd + bwd
+        s21_pi = int(f_pass / 7e9 * len(s21_bpf))
+        s21_si = int(f_stop / 7e9 * len(s21_bpf))
+        s21_p = s21_bpf[min(s21_pi, len(s21_bpf)-1)]
+        s21_s = s21_bpf[min(s21_si, len(s21_bpf)-1)]
+        s11_p = float(np.sqrt(max(1 - np.abs(s21_p)**2, 0)))
+        s11_s = float(np.sqrt(max(1 - np.abs(s21_s)**2, 0)))
 
-        s21_pass_idx = int(f_pass / 7e9 * len(s21_bpf))
-        s21_stop_idx = int(f_stop / 7e9 * len(s21_bpf))
-        s21_pass_val = s21_bpf[min(s21_pass_idx, len(s21_bpf) - 1)]
-        s21_stop_val = s21_bpf[min(s21_stop_idx, len(s21_bpf) - 1)]
+        beta_p = 2 * np.pi * f_pass * np.sqrt(ER_SL) / C0
+        beta_s = 2 * np.pi * f_stop * np.sqrt(ER_SL) / C0
+        d_m = cum_len * 1e-3
+        V_p = np.exp(-1j * beta_p * d_m) + s11_p * np.exp(1j * beta_p * d_m)
+        V_s = np.exp(-1j * beta_s * d_m) + s11_s * np.exp(1j * beta_s * d_m)
 
-        V_pass = _field(f_pass, s21_pass_val)
-        V_stop = _field(f_stop, s21_stop_val)
+        fig_g, axes_g = plt.subplots(1, 2, figsize=(14, 5))
+        fig_g.suptitle(f"{label} — Wavefront on Board", fontsize=12, fontweight="bold")
 
-        fig_g, axes_g = plt.subplots(2, 1, figsize=(10, 4))
-        fig_g.suptitle(f"{label} — Wave Propagation", fontsize=12, fontweight="bold")
+        for ai, (ax_g, title) in enumerate(zip(axes_g,
+                [f"Passband {f_pass/1e9:.1f} GHz", f"Stopband {f_stop/1e9:.1f} GHz"])):
+            ax_g.set_facecolor(SUBSTRATE)
+            ax_g.add_patch(Rectangle((-0.3,-0.3), board_w+0.6, board_h+0.6,
+                                      fc=SUBSTRATE, ec="#444", lw=1.5, zorder=0))
+            ax_g.set_xlim(-1, board_w+1); ax_g.set_ylim(-1, board_h+1)
+            ax_g.set_aspect("equal"); ax_g.set_title(title, fontsize=10)
+            ax_g.set_xlabel("mm"); ax_g.set_ylabel("mm")
+            ax_g.plot(pts[:,0], pts[:,1], color="#333", lw=0.5, zorder=1)
 
-        vmax = max(np.max(np.abs(np.real(V_pass))), np.max(np.abs(np.real(V_stop))), 0.1)
-
-        ims = []
-        for ax_g, title in zip(axes_g, [f"Passband {f_pass/1e9:.1f} GHz", f"Stopband {f_stop/1e9:.1f} GHz"]):
-            ax_g.set_xlim(x_mm[0], x_mm[-1]); ax_g.set_ylim(-vmax * 1.2, vmax * 1.2)
-            ax_g.set_ylabel(title, fontsize=8); ax_g.grid(True, alpha=0.2)
-            if ax_g == axes_g[-1]: ax_g.set_xlabel("Position [mm]")
-
-        line_p, = axes_g[0].plot([], [], "b", lw=1.5)
-        line_s, = axes_g[1].plot([], [], "r", lw=1.5)
+        scat_p = axes_g[0].scatter(pts[:,0], pts[:,1], c=np.zeros(n_pts),
+                                    cmap="RdBu_r", vmin=-2, vmax=2, s=8, zorder=3)
+        scat_s = axes_g[1].scatter(pts[:,0], pts[:,1], c=np.zeros(n_pts),
+                                    cmap="RdBu_r", vmin=-2, vmax=2, s=8, zorder=3)
 
         def _update(frame):
-            t = frame / n_frames * (1 / f_pass)
-            omega_p = 2 * np.pi * f_pass
-            omega_s = 2 * np.pi * f_stop
-            line_p.set_data(x_mm, np.real(V_pass * np.exp(1j * omega_p * t)))
-            line_s.set_data(x_mm, np.real(V_stop * np.exp(1j * omega_s * t)))
-            return line_p, line_s
+            t = frame / n_frames / f_pass
+            c_p = np.real(V_p * np.exp(1j * 2 * np.pi * f_pass * t))
+            c_s = np.real(V_s * np.exp(1j * 2 * np.pi * f_stop * t))
+            scat_p.set_array(c_p)
+            scat_s.set_array(c_s)
+            return scat_p, scat_s
 
         _update(0)
-        ani = animation.FuncAnimation(fig_g, _update, frames=n_frames, interval=1000 // fps, blit=True)
+        ani = animation.FuncAnimation(fig_g, _update, frames=n_frames,
+                                       interval=1000//fps, blit=True)
         try:
             ani.save(fname, writer=animation.PillowWriter(fps=fps))
             print(f"  [saved] {fname}")
@@ -591,10 +620,12 @@ def main():
         plt.close(fig_g)
         return fname
 
-    print("\n  Generating wave propagation GIFs...")
-    gf = _wave_gif(s21b1_std, "Standard BPF1 (N=5)", "board_standard_wave.gif", 3.1e9, 1.5e9)
+    print("\n  Generating 2D wave propagation GIFs...")
+    gf = _wave_gif_2d(b1pts1, s21b1_std, "Standard BPF1 (N=5)",
+                       "board_standard_wave.gif", 3.1e9, 1.5e9, bw1, bh1)
     if gf: generated.append(gf)
-    gf = _wave_gif(s21b1_stp, "Steep BPF1 (N=9)", "board_steep_wave.gif", 3.1e9, 1.5e9)
+    gf = _wave_gif_2d(b1pts2, s21b1_stp, "Steep BPF1 (N=9)",
+                       "board_steep_wave.gif", 3.1e9, 1.5e9, bw2, bh2)
     if gf: generated.append(gf)
 
     print("\n" + "=" * 64)
