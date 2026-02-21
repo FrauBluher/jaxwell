@@ -179,53 +179,58 @@ def _hpf_loss(p, freqs):
     return loss / freqs.shape[0]
 
 # ═══════════════════════════════════════════════════════════════════════
-#  BPF — Stub-loaded (5th-order, short line + shunt open stub per res.)
+#  BPF — Stub-loaded (parameterised order)
 # ═══════════════════════════════════════════════════════════════════════
-BPF_BND = [(5, 1e-3, 10e-3), (5, 1e-3, 10e-3), (5, 25., 120.), (6, 0.01, 2.0)]
+CHEBY_G7 = [1.0, 1.7372, 1.2583, 2.6381, 1.3444, 2.6381, 1.2583, 1.7372, 1.0]
 
-def _bpf_init(fc, fbw):
-    g = CHEBY_G5; n = 5
+def _bpf_bounds(n):
+    return [(n, 1e-3, 10e-3), (n, 1e-3, 10e-3), (n, 25., 120.), (n + 1, 0.01, 2.0)]
+
+def _bpf_init(fc, fbw, n=5, g=None):
+    if g is None: g = CHEBY_G5
     J = [float(np.sqrt(np.pi * fbw / (2 * g[0] * g[1])))]
     for i in range(1, n):
         J.append(float(np.pi * fbw / (2 * np.sqrt(g[i] * g[i + 1]))))
     J.append(float(np.sqrt(np.pi * fbw / (2 * g[n] * g[n + 1]))))
     J = [max(min(j, 1.99), 0.011) for j in J]
     lam8 = min(C0 / (fc * np.sqrt(ER_SL)) / 8, 8e-3)
-    return _pack([lam8] * n + [lam8 * 1.2] * n + [70.] * n + J, BPF_BND)
+    return _pack([lam8] * n + [lam8 * 1.2] * n + [70.] * n + J, _bpf_bounds(n))
 
-def _bpf_at_f(p, f):
-    ll, sl, sz, jn = _unpack(p, BPF_BND)
-    J = jn / Z_REF
-    M0 = ajinv(J[0])
-    def body(M, x):
-        line_l, stub_l, stub_z, j_next = x
-        gl = _glsl(f, line_l)
-        gs = (TAND_SL * jnp.pi * f * jnp.sqrt(ER_SL) / C0
-              + 1j * 2 * jnp.pi * f * jnp.sqrt(ER_SL) / C0) * stub_l
-        Y_stub = 1j * jnp.tan(jnp.imag(gs)) / stub_z
-        return M @ atl(Z_REF, gl) @ ash(Y_stub) @ ajinv(j_next), None
-    Mf, _ = jax.lax.scan(body, M0, (ll, sl, sz, J[1:]))
-    return atos(Mf)
+def _make_bpf_at_f(n):
+    bnd = _bpf_bounds(n)
+    def _at_f(p, f):
+        ll, sl, sz, jn = _unpack(p, bnd)
+        J = jn / Z_REF
+        M0 = ajinv(J[0])
+        def body(M, x):
+            line_l, stub_l, stub_z, j_next = x
+            gl = _glsl(f, line_l)
+            gs = (TAND_SL * jnp.pi * f * jnp.sqrt(ER_SL) / C0
+                  + 1j * 2 * jnp.pi * f * jnp.sqrt(ER_SL) / C0) * stub_l
+            Y_stub = 1j * jnp.tan(jnp.imag(gs)) / stub_z
+            return M @ atl(Z_REF, gl) @ ash(Y_stub) @ ajinv(j_next), None
+        Mf, _ = jax.lax.scan(body, M0, (ll, sl, sz, J[1:]))
+        return atos(Mf)
+    return _at_f
 
-_bpf_batch = jax.vmap(_bpf_at_f, in_axes=(None, 0))
-
-def _bpf_trace(p):
-    ll, sl, _, _ = _unpack(p, BPF_BND)
+def _bpf_trace(p, n):
+    bnd = _bpf_bounds(n)
+    ll, sl, _, _ = _unpack(p, bnd)
     return float(jnp.sum(ll) + jnp.sum(sl)) * 1e3
 
-def _bpf_loss(fl, fh):
+def _bpf_loss(fl, fh, batch_fn, guard=0.3):
     bw = fh - fl
     def loss_fn(p, freqs):
-        s21, s11 = _bpf_batch(p, freqs)
+        s21, s11 = batch_fn(p, freqs)
         s21d = 20 * jnp.log10(jnp.clip(jnp.abs(s21), 1e-12, None))
         s11d = 20 * jnp.log10(jnp.clip(jnp.abs(s11), 1e-12, None))
         pb = (freqs >= fl) & (freqs <= fh)
-        slo = freqs < (fl - 0.3 * bw)
-        shi = freqs > (fh + 0.3 * bw)
+        slo = freqs < (fl - guard * bw)
+        shi = freqs > (fh + guard * bw)
         loss = jnp.sum(jnp.where(pb, jnp.maximum(-s21d - 1.5, 0.) ** 2, 0.)) * 6
         loss += jnp.sum(jnp.where(pb, jnp.maximum(s11d + 10, 0.) ** 2, 0.)) * 2
-        loss += jnp.sum(jnp.where(slo, jnp.maximum(s21d + 15, 0.) ** 2, 0.)) * 3
-        loss += jnp.sum(jnp.where(shi, jnp.maximum(s21d + 15, 0.) ** 2, 0.)) * 3
+        loss += jnp.sum(jnp.where(slo, jnp.maximum(s21d + 20, 0.) ** 2, 0.)) * 4
+        loss += jnp.sum(jnp.where(shi, jnp.maximum(s21d + 20, 0.) ** 2, 0.)) * 4
         return loss / freqs.shape[0]
     return loss_fn
 
@@ -323,82 +328,54 @@ def _layer_ax(fig, pos, title, bw, bh):
 # ═══════════════════════════════════════════════════════════════════════
 #  Main
 # ═══════════════════════════════════════════════════════════════════════
-def main():
-    freqs = jnp.linspace(0.1e9, 7e9, 500)
-    fp = jnp.linspace(0.1e9, 7e9, 1000)
-    f_ghz = np.array(fp) / 1e9
-    db = lambda s: 20 * np.log10(np.clip(np.abs(np.array(s)), 1e-12, None))
+def _design_board(label, prefix, n_bpf, g_bpf, guard, p_hpf, hpf_data,
+                   freqs, fp, f_ghz, db, f1l, f1h, f2l, f2h):
+    """Optimise BPFs and render one complete board variant."""
     generated = []
+    fc1, fbw1 = (f1l + f1h) / 2, (f1h - f1l) / ((f1l + f1h) / 2)
+    fc2, fbw2 = (f2l + f2h) / 2, (f2h - f2l) / ((f2l + f2h) / 2)
 
-    f1l, f1h = 2.5e9, 3.75e9; fc1 = (f1l + f1h) / 2; fbw1 = (f1h - f1l) / fc1
-    f2l, f2h = 3.75e9, 5.0e9;  fc2 = (f2l + f2h) / 2; fbw2 = (f2h - f2l) / fc2
+    bpf_at_f = _make_bpf_at_f(n_bpf)
+    bpf_batch = jax.vmap(bpf_at_f, in_axes=(None, 0))
 
-    print("=" * 64)
-    print("  Compact SMT Filter Module — Stub-Loaded BPF")
-    print("=" * 64)
-    print(f"  Substrate : RO3010 er={ER_CORE} (L1) + RO4450F er={ER_SL} (stripline)")
-    print(f"  50Ω MS {W50_MM:.3f}mm  SL {SL_W50_MM:.3f}mm  Thickness {TOTAL_H * 1e3:.2f}mm")
-    print()
+    print(f"\n{'='*64}\n  {label} — BPF1 2.5-3.75 GHz (N={n_bpf})\n{'='*64}")
+    loss1 = _bpf_loss(f1l, f1h, bpf_batch, guard)
+    p_b1 = _opt(loss1, lambda: _bpf_init(fc1, fbw1, n_bpf, g_bpf), freqs, n_r=3, n_steps=3000)
 
-    # ── Optimise ─────────────────────────────────────────────────────
-    print("=" * 64); print("  HPF fc=2.5GHz (L1, 5th-order stubs+MIM)"); print("=" * 64)
-    p_hpf = _opt(_hpf_loss, _hpf_init, freqs, n_r=2, n_steps=2500)
+    print(f"\n{'='*64}\n  {label} — BPF2 3.75-5.0 GHz (N={n_bpf})\n{'='*64}")
+    loss2 = _bpf_loss(f2l, f2h, bpf_batch, guard)
+    p_b2 = _opt(loss2, lambda: _bpf_init(fc2, fbw2, n_bpf, g_bpf), freqs, n_r=3, n_steps=3000)
 
-    print("\n" + "=" * 64); print("  BPF1 2.5-3.75GHz (L3, stub-loaded)"); print("=" * 64)
-    p_b1 = _opt(_bpf_loss(f1l, f1h), lambda: _bpf_init(fc1, fbw1), freqs, n_r=3, n_steps=3000)
+    s21b1_np = np.array(bpf_batch(p_b1, fp)[0])
+    s11b1_np = np.array(bpf_batch(p_b1, fp)[1])
+    s21b2_np = np.array(bpf_batch(p_b2, fp)[0])
+    s11b2_np = np.array(bpf_batch(p_b2, fp)[1])
 
-    print("\n" + "=" * 64); print("  BPF2 3.75-5.0GHz (L5, stub-loaded)"); print("=" * 64)
-    p_b2 = _opt(_bpf_loss(f2l, f2h), lambda: _bpf_init(fc2, fbw2), freqs, n_r=3, n_steps=3000)
-
-    # ── Evaluate ─────────────────────────────────────────────────────
-    s21h, s11h = _hpf_batch(p_hpf, fp)
-    s21b1, s11b1 = _bpf_batch(p_b1, fp)
-    s21b2, s11b2 = _bpf_batch(p_b2, fp)
-    s21h_np = np.array(s21h); s11h_np = np.array(s11h)
-    s21b1_np = np.array(s21b1); s11b1_np = np.array(s11b1)
-    s21b2_np = np.array(s21b2); s11b2_np = np.array(s11b2)
-
-    # ── Physical dimensions ──────────────────────────────────────────
-    sz, sl, cp, ll = (np.array(x) for x in _unpack(p_hpf, HPF_BND))
+    sz, sl, cp, ll, s21h_np, s11h_np = hpf_data
     hpf_total = float(np.sum(sl) + np.sum(ll)) * 1e3
-    t1 = _bpf_trace(p_b1); t2 = _bpf_trace(p_b2)
+    t1 = _bpf_trace(p_b1, n_bpf); t2 = _bpf_trace(p_b2, n_bpf)
     max_stub_mm = float(np.max(sl)) * 1e3
 
-    # ── Board sizing (aggressive meander) ────────────────────────────
     longest = max(hpf_total, t1, t2)
-    usable_target = 14.0
-    nf = max(1, int(np.ceil(longest / usable_target)))
-    BW = float(np.ceil(longest / nf + 2 * EDGE_PAD))
-    BW = max(BW, 10)
-
-    CH_HPF = max_stub_mm + 1.5
-    usable_w = BW - 2 * EDGE_PAD
-    def _ch(trace):
-        return 0.5 + max(1, int(np.ceil(trace / usable_w))) * FOLD_GAP
+    nf = max(1, int(np.ceil(longest / 14.0)))
+    BW = float(np.ceil(longest / nf + 2 * EDGE_PAD)); BW = max(BW, 10)
+    CH_HPF = max_stub_mm + 1.5; uw = BW - 2 * EDGE_PAD
+    def _ch(tr): return 0.5 + max(1, int(np.ceil(tr / uw))) * FOLD_GAP
     ch_b1 = _ch(t1); ch_b2 = _ch(t2); ch_hpf = max(CH_HPF, _ch(hpf_total))
     BH = float(np.ceil(EDGE_PAD + ch_hpf + PAD_PITCH + ch_b1 + PAD_PITCH + ch_b2 + EDGE_PAD))
     BH = max(BH, 8)
+    y_hpf = BH - EDGE_PAD - 0.5
+    y_b1 = y_hpf - ch_hpf - PAD_PITCH + 0.5
+    y_b2 = y_b1 - ch_b1 - PAD_PITCH
 
-    y_hpf  = BH - EDGE_PAD - 0.5
-    y_bpf1 = y_hpf - ch_hpf - PAD_PITCH + 0.5
-    y_bpf2 = y_bpf1 - ch_b1 - PAD_PITCH
-
-    print(f"\n  BOARD: {BW:.0f} x {BH:.0f} mm  ({BW * BH:.0f} mm²)")
-    print(f"  HPF trace  {hpf_total:.1f}mm (y={y_hpf:.1f})")
-    print(f"  BPF1 trace {t1:.1f}mm (y={y_bpf1:.1f})")
-    print(f"  BPF2 trace {t2:.1f}mm (y={y_bpf2:.1f})")
-
-    # ── Meander paths ────────────────────────────────────────────────
     hpf_segs = []
     for k in range(3):
         hpf_segs.append(ll[k] * 1e3 if k < len(ll) else 1)
         hpf_segs.append(sl[k] * 1e3)
     if len(ll) > 3: hpf_segs.append(ll[3] * 1e3)
-
     hpf_pts = _meander_pts(EDGE_PAD, y_hpf, hpf_segs, BW)
-    bpf1_pts = _meander_pts(EDGE_PAD, y_bpf1, [t1 / 10] * 10, BW)
-    bpf2_pts = _meander_pts(EDGE_PAD, y_bpf2, [t2 / 10] * 10, BW)
-
+    bpf1_pts = _meander_pts(EDGE_PAD, y_b1, [t1 / (2 * n_bpf)] * (2 * n_bpf), BW)
+    bpf2_pts = _meander_pts(EDGE_PAD, y_b2, [t2 / (2 * n_bpf)] * (2 * n_bpf), BW)
     stub_w_mm = [float(_ms_width(jnp.array(float(sz[k])))) * 1e3 for k in range(3)]
     mim_pads = [np.sqrt(float(cp[k]) * H_CORE / (EPS0 * ER_CORE)) * 1e3 for k in range(2)]
     stub_xs = []; cum = EDGE_PAD
@@ -406,98 +383,133 @@ def main():
         cum += hpf_segs[2 * k]; stub_xs.append(min(cum, BW - 2))
         cum += hpf_segs[2 * k + 1] if 2 * k + 1 < len(hpf_segs) else 0
 
-    # ── Pads and exclusions ──────────────────────────────────────────
-    pads = [(0, BH - 1, "G"), (0, y_hpf, "H"), (0, y_bpf1, "1"), (0, y_bpf2, "2"), (0, 1, "G"),
-            (BW, BH - 1, "G"), (BW, y_hpf, "H"), (BW, y_bpf1, "1"), (BW, y_bpf2, "2"), (BW, 1, "G")]
+    pads = [(0, BH-1, "G"), (0, y_hpf, "H"), (0, y_b1, "1"), (0, y_b2, "2"), (0, 1, "G"),
+            (BW, BH-1, "G"), (BW, y_hpf, "H"), (BW, y_b1, "1"), (BW, y_b2, "2"), (BW, 1, "G")]
     excl = [(px, py, 1.8) for px, py, _ in pads]
-    gnd_voids = [(px - 0.4 if px > 0 else -0.1, py - 0.4, 0.8, 0.8)
-                 for px, py, lb in pads if lb != "G"]
-
+    gnd_voids = [(px-0.4 if px>0 else -0.1, py-0.4, 0.8, 0.8) for px,py,lb in pads if lb!="G"]
     def _pads(ax, hi=None):
-        for px, py, lb in pads:
+        for px,py,lb in pads:
             _draw_castellated(ax, px, py)
             if lb != "G":
-                tx = px + (1.2 if px < BW / 2 else -1.2)
-                ha = "left" if px < BW / 2 else "right"
-                lbl = {"H": "HPF", "1": "BPF1", "2": "BPF2"}[lb]
-                c = "#e74c3c" if hi and lb == hi else "#888"
-                fw = "bold" if hi and lb == hi else "normal"
-                ax.text(tx, py, lbl, fontsize=5, ha=ha, va="center", color=c, fontweight=fw)
+                tx = px + (1.2 if px < BW/2 else -1.2)
+                ha = "left" if px < BW/2 else "right"
+                lbl = {"H":"HPF","1":"BPF1","2":"BPF2"}[lb]
+                c = "#e74c3c" if hi and lb==hi else "#888"
+                ax.text(tx, py, lbl, fontsize=5, ha=ha, va="center", color=c,
+                        fontweight="bold" if hi and lb==hi else "normal")
 
-    # ── Render 6-layer copper artwork ────────────────────────────────
+    # 6-layer copper artwork
     fig = plt.figure(figsize=(21, 14))
-    fig.suptitle(f"SMT Filter Module — {BW:.0f} x {BH:.0f} mm  |  6-Layer Copper",
-                 fontsize=14, fontweight="bold")
-
-    # L1 HPF
-    ax = _layer_ax(fig, (2, 3, 1), "L1 — HPF Signal", BW, BH)
+    fig.suptitle(f"{label} — {BW:.0f}×{BH:.0f}mm  |  6-Layer Copper", fontsize=14, fontweight="bold")
+    ax = _layer_ax(fig, (2,3,1), "L1 HPF", BW, BH)
     _draw_trace(ax, hpf_pts, W50_MM)
     for k in range(3):
-        sx = stub_xs[k]; se = y_hpf - sl[k] * 1e3
-        _draw_trace(ax, [(sx, y_hpf), (sx, se)], stub_w_mm[k], color="#d4a040")
-        _draw_via(ax, sx, se - 0.3)
+        sx=stub_xs[k]; se=y_hpf-sl[k]*1e3
+        _draw_trace(ax, [(sx,y_hpf),(sx,se)], stub_w_mm[k], color="#d4a040")
+        _draw_via(ax, sx, se-0.3)
     for k in range(2):
-        cx = stub_xs[k] + (stub_xs[min(k + 1, 2)] - stub_xs[k]) * 0.5
-        cx = min(max(cx, 2), BW - 2); ps = mim_pads[k]
-        ax.add_patch(Rectangle((cx - ps / 2, y_hpf - ps / 2), ps, ps,
-                                fc="#e8d080", ec=CU_DARK, lw=0.4, zorder=4))
-    _pads(ax, "H"); _draw_via_fence(ax, BW, BH, excl)
-
-    # L2 Ground
-    ax = _layer_ax(fig, (2, 3, 2), "L2 — Ground (HPF ref)", BW, BH)
+        cx=stub_xs[k]+(stub_xs[min(k+1,2)]-stub_xs[k])*0.5; cx=min(max(cx,2),BW-2); ps=mim_pads[k]
+        ax.add_patch(Rectangle((cx-ps/2,y_hpf-ps/2),ps,ps,fc="#e8d080",ec=CU_DARK,lw=0.4,zorder=4))
+    _pads(ax,"H"); _draw_via_fence(ax,BW,BH,excl)
+    ax = _layer_ax(fig, (2,3,2), "L2 Ground", BW, BH)
     voids = list(gnd_voids)
     for k in range(2):
-        cx = stub_xs[k] + (stub_xs[min(k + 1, 2)] - stub_xs[k]) * 0.5
-        cx = min(max(cx, 2), BW - 2); ps = mim_pads[k] + 0.3
-        voids.append((cx - ps / 2, y_hpf - ps / 2, ps, ps))
-    for sx in stub_xs:
-        voids.append((sx - 0.3, y_hpf - sl.max() * 1e3 - 0.8, 0.6, 0.6))
-    _draw_gnd_pour(ax, BW, BH, voids); _draw_via_fence(ax, BW, BH, excl); _pads(ax)
-
-    # L3 BPF1
-    ax = _layer_ax(fig, (2, 3, 3), f"L3 — BPF1 ({t1:.0f}mm)", BW, BH)
+        cx=stub_xs[k]+(stub_xs[min(k+1,2)]-stub_xs[k])*0.5; cx=min(max(cx,2),BW-2); ps=mim_pads[k]+0.3
+        voids.append((cx-ps/2,y_hpf-ps/2,ps,ps))
+    for sx in stub_xs: voids.append((sx-0.3,y_hpf-sl.max()*1e3-0.8,0.6,0.6))
+    _draw_gnd_pour(ax,BW,BH,voids); _draw_via_fence(ax,BW,BH,excl); _pads(ax)
+    ax = _layer_ax(fig, (2,3,3), f"L3 BPF1 ({t1:.0f}mm)", BW, BH)
     _draw_trace(ax, bpf1_pts, SL_W50_MM, color="#3498db")
-    _draw_via(ax, EDGE_PAD, y_bpf1); _draw_via(ax, BW - EDGE_PAD, y_bpf1)
-    _pads(ax, "1"); _draw_via_fence(ax, BW, BH, excl)
-
-    # L4 Ground
-    ax = _layer_ax(fig, (2, 3, 4), "L4 — Ground (shared)", BW, BH)
-    _draw_gnd_pour(ax, BW, BH, gnd_voids); _draw_via_fence(ax, BW, BH, excl); _pads(ax)
-
-    # L5 BPF2
-    ax = _layer_ax(fig, (2, 3, 5), f"L5 — BPF2 ({t2:.0f}mm)", BW, BH)
+    _draw_via(ax,EDGE_PAD,y_b1); _draw_via(ax,BW-EDGE_PAD,y_b1); _pads(ax,"1"); _draw_via_fence(ax,BW,BH,excl)
+    ax = _layer_ax(fig, (2,3,4), "L4 Ground", BW, BH)
+    _draw_gnd_pour(ax,BW,BH,gnd_voids); _draw_via_fence(ax,BW,BH,excl); _pads(ax)
+    ax = _layer_ax(fig, (2,3,5), f"L5 BPF2 ({t2:.0f}mm)", BW, BH)
     _draw_trace(ax, bpf2_pts, SL_W50_MM, color="#9b59b6")
-    _draw_via(ax, EDGE_PAD, y_bpf2); _draw_via(ax, BW - EDGE_PAD, y_bpf2)
-    _pads(ax, "2"); _draw_via_fence(ax, BW, BH, excl)
+    _draw_via(ax,EDGE_PAD,y_b2); _draw_via(ax,BW-EDGE_PAD,y_b2); _pads(ax,"2"); _draw_via_fence(ax,BW,BH,excl)
+    ax = _layer_ax(fig, (2,3,6), "L6 Ground", BW, BH)
+    _draw_gnd_pour(ax,BW,BH,gnd_voids); _draw_via_fence(ax,BW,BH,excl); _pads(ax)
+    fig.tight_layout(rect=[0,0,1,0.95])
+    fn = f"{prefix}_copper.png"; fig.savefig(fn, dpi=200); plt.close(fig); generated.append(fn)
 
-    # L6 Ground
-    ax = _layer_ax(fig, (2, 3, 6), "L6 — Ground (bottom)", BW, BH)
-    _draw_gnd_pour(ax, BW, BH, gnd_voids); _draw_via_fence(ax, BW, BH, excl); _pads(ax)
-
-    fig.tight_layout(rect=[0, 0, 1, 0.95])
-    fig.savefig("board_copper_layers.png", dpi=200); plt.close(fig)
-    generated.append("board_copper_layers.png")
-
-    # ── Frequency response plot ──────────────────────────────────────
+    # Response
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    fig.suptitle(f"SMT Filter Module — {BW:.0f}×{BH:.0f}mm  |  Stub-Loaded BPF",
-                 fontsize=14, fontweight="bold")
+    fig.suptitle(f"{label} — {BW:.0f}×{BH:.0f}mm", fontsize=14, fontweight="bold")
     for ax, s21, s11, title, vl in [
-        (axes[0], s21h_np, s11h_np, "HPF fc=2.5GHz (L1)", [2.5]),
-        (axes[1], s21b1_np, s11b1_np, "BPF1 2.5-3.75GHz (L3)", [2.5, 3.75]),
-        (axes[2], s21b2_np, s11b2_np, "BPF2 3.75-5.0GHz (L5)", [3.75, 5.0]),
+        (axes[0], s21h_np, s11h_np, "HPF (L1)", [2.5]),
+        (axes[1], s21b1_np, s11b1_np, f"BPF1 N={n_bpf} (L3)", [2.5, 3.75]),
+        (axes[2], s21b2_np, s11b2_np, f"BPF2 N={n_bpf} (L5)", [3.75, 5.0]),
     ]:
         ax.plot(f_ghz, db(s21), "b", lw=1.5, label="|S21|")
         ax.plot(f_ghz, db(s11), "r--", lw=1, label="|S11|")
         ax.set_title(title, fontsize=10); ax.set_xlabel("GHz"); ax.set_ylabel("dB")
         ax.set_ylim(-50, 3); ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
         for fv in vl: ax.axvline(fv, color="gray", ls=":", lw=0.8)
-    fig.tight_layout(); fig.savefig("board_response.png", dpi=200); plt.close(fig)
-    generated.append("board_response.png")
+    fig.tight_layout()
+    fn = f"{prefix}_response.png"; fig.savefig(fn, dpi=200); plt.close(fig); generated.append(fn)
 
-    # ── Stackup ──────────────────────────────────────────────────────
+    print(f"\n  {label}: {BW:.0f}×{BH:.0f}mm ({BW*BH:.0f}mm²)")
+    for name, s21, vl in [("HPF",s21h_np,[2.5,5.5]),("BPF1",s21b1_np,[2.5,3.75]),("BPF2",s21b2_np,[3.75,5.0])]:
+        s21d = db(s21); pb = (f_ghz>=vl[0])&(f_ghz<=vl[-1])
+        if np.any(pb):
+            print(f"  {name:5s} IL: {float(-np.max(s21d[pb])):.1f} - {float(-np.min(s21d[pb])):.1f} dB")
+    return generated, s21b1_np, s11b1_np, s21b2_np, s11b2_np, BW, BH
+
+
+def main():
+    freqs = jnp.linspace(0.1e9, 7e9, 500)
+    fp = jnp.linspace(0.1e9, 7e9, 1000)
+    f_ghz = np.array(fp) / 1e9
+    db = lambda s: 20 * np.log10(np.clip(np.abs(np.array(s)), 1e-12, None))
+    generated = []
+    f1l, f1h = 2.5e9, 3.75e9; f2l, f2h = 3.75e9, 5.0e9
+
+    print("=" * 64)
+    print("  Compact SMT Filter Module — Standard & Steep Rolloff")
+    print("=" * 64)
+    print(f"  Substrate: RO3010 er={ER_CORE} + RO4450F er={ER_SL}")
+    print(f"  50Ω MS {W50_MM:.3f}mm  SL {SL_W50_MM:.3f}mm  Thickness {TOTAL_H*1e3:.2f}mm\n")
+
+    # Shared HPF
+    print("=" * 64); print("  HPF fc=2.5GHz (shared, L1)"); print("=" * 64)
+    p_hpf = _opt(_hpf_loss, _hpf_init, freqs, n_r=2, n_steps=2500)
+    s21h_np = np.array(_hpf_batch(p_hpf, fp)[0])
+    s11h_np = np.array(_hpf_batch(p_hpf, fp)[1])
+    sz, sl, cp, ll = (np.array(x) for x in _unpack(p_hpf, HPF_BND))
+    hpf_data = (sz, sl, cp, ll, s21h_np, s11h_np)
+
+    # Board 1: Standard (N=5, 0.3 guard)
+    g1, s21b1_std, s11b1_std, s21b2_std, s11b2_std, bw1, bh1 = _design_board(
+        "Standard (N=5)", "board_standard",
+        5, CHEBY_G5, 0.3, p_hpf, hpf_data,
+        freqs, fp, f_ghz, db, f1l, f1h, f2l, f2h)
+    generated.extend(g1)
+
+    # Board 2: Steep rolloff (N=7, 0.15 guard)
+    g2, s21b1_stp, s11b1_stp, s21b2_stp, s11b2_stp, bw2, bh2 = _design_board(
+        "Steep Rolloff (N=7)", "board_steep",
+        7, CHEBY_G7, 0.15, p_hpf, hpf_data,
+        freqs, fp, f_ghz, db, f1l, f1h, f2l, f2h)
+    generated.extend(g2)
+
+    # Comparison overlay
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig.suptitle("BPF Rolloff Comparison: Standard (N=5) vs Steep (N=7)", fontsize=13, fontweight="bold")
+    for ax, s21_s, s21_st, title, vl in [
+        (axes[0], s21b1_std, s21b1_stp, "BPF1 2.5-3.75 GHz", [2.5, 3.75]),
+        (axes[1], s21b2_std, s21b2_stp, "BPF2 3.75-5.0 GHz", [3.75, 5.0]),
+    ]:
+        ax.plot(f_ghz, db(s21_s), "b", lw=1.5, label=f"N=5 ({bw1:.0f}×{bh1:.0f}mm)")
+        ax.plot(f_ghz, db(s21_st), "r", lw=1.5, label=f"N=7 steep ({bw2:.0f}×{bh2:.0f}mm)")
+        ax.set_title(title); ax.set_xlabel("GHz"); ax.set_ylabel("|S21| [dB]")
+        ax.set_ylim(-50, 3); ax.legend(fontsize=9); ax.grid(True, alpha=0.3)
+        for fv in vl: ax.axvline(fv, color="gray", ls=":", lw=0.8)
+    fig.tight_layout()
+    fig.savefig("board_rolloff_comparison.png", dpi=200); plt.close(fig)
+    generated.append("board_rolloff_comparison.png")
+
+    # Stackup (shared)
     fig_s, ax_s = plt.subplots(figsize=(10, 5))
-    ax_s.set_title(f"6-Layer Stackup — {BW:.0f}×{BH:.0f}mm SMT Module", fontsize=13, fontweight="bold")
+    ax_s.set_title("6-Layer Stackup", fontsize=13, fontweight="bold")
     stack = [
         ("L1 HPF signal", 35e-6, "#e67e22"), ("RO3010 er=10.2", H_CORE, "#f5e6d3"),
         ("L2 Ground", 35e-6, "#27ae60"), ("RO4450F er=3.52", H_SL, "#ecf0f1"),
@@ -507,35 +519,16 @@ def main():
         ("L6 Ground", 35e-6, "#27ae60"),
     ]
     y = 0
-    for label, t, c in reversed(stack):
-        h = max(t * 1e3, 0.015)
-        ax_s.add_patch(Rectangle((1, y), 8, h, fc=c, ec="#333", lw=0.8))
-        ax_s.text(9.3, y + h / 2, label, va="center", fontsize=8, fontfamily="monospace")
+    for label_s, t, c in reversed(stack):
+        h = max(t*1e3, 0.015)
+        ax_s.add_patch(Rectangle((1,y),8,h,fc=c,ec="#333",lw=0.8))
+        ax_s.text(9.3, y+h/2, label_s, va="center", fontsize=8, fontfamily="monospace")
         y += h
-    ax_s.set_xlim(0, 20); ax_s.set_ylim(-0.02, y + 0.04)
-    ax_s.set_ylabel("mm"); ax_s.set_xticks([])
-    ax_s.text(5, y + 0.025, f"Total: {TOTAL_H * 1e3:.2f} mm", ha="center",
-              fontsize=11, fontweight="bold")
+    ax_s.set_xlim(0,20); ax_s.set_ylim(-0.02,y+0.04); ax_s.set_ylabel("mm"); ax_s.set_xticks([])
+    ax_s.text(5, y+0.025, f"Total: {TOTAL_H*1e3:.2f} mm", ha="center", fontsize=11, fontweight="bold")
     fig_s.tight_layout(); fig_s.savefig("board_stackup.png", dpi=200); plt.close(fig_s)
     generated.append("board_stackup.png")
 
-    # ── Performance ──────────────────────────────────────────────────
-    print("\n" + "=" * 64)
-    print(f"  MODULE: {BW:.0f} × {BH:.0f} mm  ({BW * BH:.0f} mm²)  {TOTAL_H * 1e3:.2f} mm thick")
-    print("=" * 64)
-    for name, s21, vl in [("HPF", s21h_np, [2.5, 5.5]),
-                           ("BPF1", s21b1_np, [2.5, 3.75]),
-                           ("BPF2", s21b2_np, [3.75, 5.0])]:
-        s21d = db(s21); pb = (f_ghz >= vl[0]) & (f_ghz <= vl[-1])
-        if np.any(pb):
-            print(f"  {name:5s}  IL: {float(-np.max(s21d[pb])):.1f} - {float(-np.min(s21d[pb])):.1f} dB")
-
-    print(f"\n  BPF topology: stub-loaded (5th-order, 5 line+stub resonators)")
-    print(f"  Evaluated but rejected:")
-    print(f"    A) Coupled-resonator λ/2 — larger board, 2.8-8.0 dB BPF1 IL")
-    print(f"    B) Hairpin λ/4 — similar size, 0.4-11.2 dB BPF1 IL (inconsistent)")
-
-    # ── Output ───────────────────────────────────────────────────────
     print("\n" + "=" * 64)
     print("  OUTPUT IMAGES")
     print("=" * 64)
