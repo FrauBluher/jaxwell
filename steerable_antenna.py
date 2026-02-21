@@ -305,24 +305,18 @@ def main():
             )
         )
 
-    # ── 3D radiation pattern plots ───────────────────────────────────
+    # ── Shared plot grid ────────────────────────────────────────────
+    generated_images = []
+
     n_th_p, n_ph_p = 91, 180
     th_p = np.linspace(0.02, np.pi / 2 - 0.02, n_th_p)
     ph_p = np.linspace(0, 2 * np.pi, n_ph_p, endpoint=False)
     TH_p, PH_p = np.meshgrid(th_p, ph_p, indexing="ij")
     ang_p = jnp.stack([jnp.array(TH_p.ravel()), jnp.array(PH_p.ravel())], axis=-1)
+    phi_cut = np.linspace(0, 2 * np.pi, 360)
 
-    plot_idx = list(range(min(4, len(results))))
-
-    fig = plt.figure(figsize=(16, 14))
-    fig.suptitle(
-        "3D Switched Patch Array  |  Radiation Patterns (upper hemisphere)",
-        fontsize=14,
-        fontweight="bold",
-    )
-
-    for ai, ri in enumerate(plot_idx):
-        res = results[ri]
+    # ── Individual per-beam images (3D + polar on same figure) ───
+    for ri, res in enumerate(results):
         wq = _binary_weights(jnp.array(res["amp"]), jnp.array(res["phase"]))
         Ep = np.array(_pattern_batch(ang_p, wq))
         Pp = np.abs(Ep.reshape(n_th_p, n_ph_p)) ** 2
@@ -334,30 +328,85 @@ def main():
         Y = R * np.sin(TH_p) * np.sin(PH_p)
         Z = R * np.cos(TH_p)
 
+        fig_b = plt.figure(figsize=(14, 6))
+
+        ax3d = fig_b.add_subplot(1, 2, 1, projection="3d")
+        colors = cm.hot((Pdb - Pdb.min()) / (Pdb.max() - Pdb.min() + 1e-20))
+        ax3d.plot_surface(X, Y, Z, facecolors=colors, alpha=0.85, antialiased=True)
+        tr, pr = res["theta"], res["phi"]
+        ax3d.plot(
+            [0, 0.9 * np.sin(tr) * np.cos(pr)],
+            [0, 0.9 * np.sin(tr) * np.sin(pr)],
+            [0, 0.9 * np.cos(tr)],
+            "g-", lw=2.5,
+        )
+        ax3d.set_title(f"3D Pattern  (D = {res['D_quant']:.1f} dBi)", fontsize=11)
+        ax3d.set_xlabel("X")
+        ax3d.set_ylabel("Y")
+        ax3d.set_zlabel("Z")
+
+        ax_pol = fig_b.add_subplot(1, 2, 2, projection="polar")
+        ac = jnp.stack([jnp.full(360, res["theta"]), jnp.array(phi_cut)], axis=-1)
+        Ec = np.array(_pattern_batch(ac, wq))
+        Pc = np.abs(Ec) ** 2
+        Pcd = 10 * np.log10(Pc / (Pc.max() + 1e-20) + 1e-20)
+        Pcd = np.clip(Pcd, -30, 0)
+        ax_pol.plot(phi_cut, Pcd + 30, "b", lw=1.5)
+        ax_pol.axvline(res["phi"], color="r", ls="--", lw=1, alpha=0.7)
+        ax_pol.set_rmax(30)
+        ax_pol.set_rticks([0, 10, 20, 30])
+        ax_pol.set_yticklabels(["-30", "-20", "-10", "0 dB"])
+        ax_pol.set_title("Azimuth Cut", fontsize=11)
+
+        th_d = int(np.degrees(res["theta"]))
+        ph_d = int(np.degrees(res["phi"]))
+        fig_b.suptitle(
+            f"Beam {ri + 1}: {res['label']}  "
+            f"(th={th_d} ph={ph_d})",
+            fontsize=13, fontweight="bold",
+        )
+        fig_b.tight_layout()
+        fname = f"antenna_beam_{ri + 1}_{res['label'].replace(' ', '_')}.png"
+        fig_b.savefig(fname, dpi=180)
+        plt.close(fig_b)
+        generated_images.append(fname)
+
+    # ── Combined 3D overview (first 4 beams) ─────────────────────
+    plot_idx = list(range(min(4, len(results))))
+    fig = plt.figure(figsize=(16, 14))
+    fig.suptitle(
+        "3D Switched Patch Array  |  Radiation Patterns (upper hemisphere)",
+        fontsize=14, fontweight="bold",
+    )
+    for ai, ri in enumerate(plot_idx):
+        res = results[ri]
+        wq = _binary_weights(jnp.array(res["amp"]), jnp.array(res["phase"]))
+        Ep = np.array(_pattern_batch(ang_p, wq))
+        Pp = np.abs(Ep.reshape(n_th_p, n_ph_p)) ** 2
+        Pdb = 10 * np.log10(Pp / (Pp.max() + 1e-20) + 1e-20)
+        Pdb = np.clip(Pdb, -25, 0)
+        R = (Pdb - Pdb.min()) / (Pdb.max() - Pdb.min() + 1e-20)
+        X = R * np.sin(TH_p) * np.cos(PH_p)
+        Y = R * np.sin(TH_p) * np.sin(PH_p)
+        Z = R * np.cos(TH_p)
         ax = fig.add_subplot(2, 2, ai + 1, projection="3d")
         colors = cm.hot((Pdb - Pdb.min()) / (Pdb.max() - Pdb.min() + 1e-20))
         ax.plot_surface(X, Y, Z, facecolors=colors, alpha=0.85, antialiased=True)
-
         tr, pr = res["theta"], res["phi"]
         ax.plot(
             [0, 0.9 * np.sin(tr) * np.cos(pr)],
             [0, 0.9 * np.sin(tr) * np.sin(pr)],
             [0, 0.9 * np.cos(tr)],
-            "g-",
-            lw=2.5,
+            "g-", lw=2.5,
         )
-        ax.set_title(
-            f"{res['label']}  (D = {res['D_quant']:.1f} dBi)", fontsize=11
-        )
-        ax.set_xlabel("X")
-        ax.set_ylabel("Y")
-        ax.set_zlabel("Z")
-
+        ax.set_title(f"{res['label']}  (D = {res['D_quant']:.1f} dBi)", fontsize=11)
+        ax.set_xlabel("X"); ax.set_ylabel("Y"); ax.set_zlabel("Z")
     plt.tight_layout()
     plt.savefig("antenna_3d_patterns.png", dpi=180)
-    print(f"\n  [saved] antenna_3d_patterns.png")
+    plt.close(fig)
+    generated_images.append("antenna_3d_patterns.png")
 
-    # ── Polar cuts ───────────────────────────────────────────────────
+    # ── Combined polar cuts ──────────────────────────────────────────
     n_cut = min(len(results), 8)
     rows = (n_cut + 3) // 4
     fig2, axes2 = plt.subplots(
@@ -367,8 +416,6 @@ def main():
     fig2.suptitle(
         "Azimuth-Cut Patterns (at target elevation)", fontsize=14, fontweight="bold"
     )
-
-    phi_cut = np.linspace(0, 2 * np.pi, 360)
     for ri in range(n_cut):
         res = results[ri]
         wq = _binary_weights(jnp.array(res["amp"]), jnp.array(res["phase"]))
@@ -379,7 +426,6 @@ def main():
         Pc = np.abs(Ec) ** 2
         Pcd = 10 * np.log10(Pc / (Pc.max() + 1e-20) + 1e-20)
         Pcd = np.clip(Pcd, -30, 0)
-
         ax = axes_flat[ri]
         ax.plot(phi_cut, Pcd + 30, "b", lw=1.4)
         ax.axvline(res["phi"], color="r", ls="--", lw=1, alpha=0.7)
@@ -387,13 +433,12 @@ def main():
         ax.set_rticks([0, 10, 20, 30])
         ax.set_yticklabels(["-30", "-20", "-10", "0 dB"])
         ax.set_title(f"{res['label']}, D={res['D_quant']:.1f} dBi", fontsize=9)
-
     for ri in range(n_cut, len(axes_flat)):
         axes_flat[ri].set_visible(False)
-
     plt.tight_layout()
     plt.savefig("antenna_polar_cuts.png", dpi=180)
-    print(f"  [saved] antenna_polar_cuts.png")
+    plt.close(fig2)
+    generated_images.append("antenna_polar_cuts.png")
 
     # ── Structure visualisation ──────────────────────────────────────
     fig3 = plt.figure(figsize=(8, 8))
@@ -421,7 +466,6 @@ def main():
         cy = np.mean(ys)
         cz = np.max(zs) + 3
         ax3.text(cx, cy, cz, labels[ip], fontsize=11, fontweight="bold", color=col)
-
         ax3.plot(xs, ys, zs, "-", color=col, alpha=0.5, lw=1.5)
 
     ax3.set_xlabel("X [mm]")
@@ -430,7 +474,8 @@ def main():
     ax3.set_box_aspect([1, 1, 0.6])
     plt.tight_layout()
     plt.savefig("antenna_structure.png", dpi=180)
-    print(f"  [saved] antenna_structure.png")
+    plt.close(fig3)
+    generated_images.append("antenna_structure.png")
 
     # ── Physical dimensions ──────────────────────────────────────────
     print()
@@ -491,7 +536,14 @@ def main():
 
     print()
     print("=" * 68)
-    print("  Complete.  Plots saved.")
+    print("  OUTPUT IMAGES")
+    print("=" * 68)
+    for img in generated_images:
+        sz = os.path.getsize(img)
+        print(f"  {img:55s}  {sz / 1024:6.0f} KB  OK")
+    print()
+    print("=" * 68)
+    print("  Complete.")
     print("=" * 68)
 
 

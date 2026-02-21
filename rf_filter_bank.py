@@ -447,7 +447,47 @@ def main():
     fg = np.array(fp) / 1e9
     db = lambda s: 20 * np.log10(np.clip(np.abs(np.array(s)), 1e-12, None))
 
-    # ── Plot ─────────────────────────────────────────────────────────
+    # ── Helper for single-filter plot ────────────────────────────────
+    generated_images = []
+
+    def _plot_filter(s21, s11, title, vlines, filename):
+        fig_f, ax_f = plt.subplots(figsize=(8, 5))
+        ax_f.plot(fg, db(s21), "b", lw=1.8, label="|S21|")
+        ax_f.plot(fg, db(s11), "r--", lw=1.2, label="|S11|")
+        ax_f.set_title(title, fontsize=13, fontweight="bold")
+        ax_f.set_xlabel("Frequency [GHz]")
+        ax_f.set_ylabel("[dB]")
+        ax_f.set_ylim(-50, 3)
+        ax_f.legend(loc="lower right", fontsize=11)
+        ax_f.grid(True, alpha=0.3)
+        for fv in vlines:
+            ax_f.axvline(fv, color="gray", ls=":", lw=0.8)
+        fig_f.tight_layout()
+        fig_f.savefig(filename, dpi=200)
+        plt.close(fig_f)
+        generated_images.append(filename)
+
+    # ── Individual filter plots ──────────────────────────────────────
+    _plot_filter(
+        s21_hpf, s11_hpf,
+        "High-Pass Filter  (fc = 2.5 GHz)  |  Rogers RO4003C",
+        [2.5],
+        "filter_hpf_response.png",
+    )
+    _plot_filter(
+        s21_b1, s11_b1,
+        "Bandpass Filter 1  (2.5 - 3.75 GHz)  |  Rogers RO4003C",
+        [2.5, 3.75],
+        "filter_bpf1_response.png",
+    )
+    _plot_filter(
+        s21_b2, s11_b2,
+        "Bandpass Filter 2  (3.75 - 5.0 GHz)  |  Rogers RO4003C",
+        [3.75, 5.0],
+        "filter_bpf2_response.png",
+    )
+
+    # ── Combined 4-panel overview ────────────────────────────────────
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     fig.suptitle(
         "PCB Planar RF Filter Bank  |  Rogers RO4003C",
@@ -490,7 +530,13 @@ def main():
 
     plt.tight_layout()
     plt.savefig("filter_bank_response.png", dpi=200)
-    print("\n  [saved] filter_bank_response.png")
+    plt.close(fig)
+    generated_images.append("filter_bank_response.png")
+
+    print()
+    for img in generated_images:
+        sz = os.path.getsize(img)
+        print(f"  [saved] {img}  ({sz / 1024:.0f} KB)")
 
     # ── Performance summary ──────────────────────────────────────────
     def _perf(s21_arr, s11_arr, flo, fhi, label):
@@ -588,7 +634,14 @@ def main():
         print(f"  Total resonator length ~ {float(np.sum(rl)) * 1e3:.1f} mm")
 
     print("\n" + "=" * 64)
-    print("  Complete.  Plot saved to filter_bank_response.png")
+    print("  OUTPUT IMAGES")
+    print("=" * 64)
+    for img in generated_images:
+        sz = os.path.getsize(img)
+        print(f"  {img:40s}  {sz / 1024:6.0f} KB  OK")
+    print()
+    print("=" * 64)
+    print("  Complete.")
     print("=" * 64)
 
 
