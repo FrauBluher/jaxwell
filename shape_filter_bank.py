@@ -218,14 +218,25 @@ def _opt(loss_fn,init_fn,freqs,n_r=3,n_steps=2500,lr=5e-3):
 # ═══════════════════════════════════════════════════════════════════════
 CU="#c8882e";CU_DARK="#a06820";SUBSTRATE="#1a1a2e";VIA_C="#ccb060";SOLDER="#d4d4d4"
 
-def _meander_pts(x0,y0,segs,bw,fg=FOLD_GAP):
-    mx=bw-EDGE_PAD;x,y,dx=x0,y0,1;pts=[(x,y)]
+def _meander_pts(x0, y0, segs, bw, fg=FOLD_GAP):
+    """Pack trace segments into board width, folding as needed.
+    Handles segments shorter than the available run by accumulating
+    them until a fold is required."""
+    x_min, x_max = EDGE_PAD, bw - EDGE_PAD
+    x, y, dx = x0, y0, 1
+    pts = [(x, y)]
+    total_remaining = sum(segs)
     for s in segs:
-        avail=(mx-x) if dx>0 else (x-EDGE_PAD); avail=max(avail,0.3)
-        if s<=avail+0.1: x+=s*dx;pts.append((x,y))
-        else:
-            x+=avail*dx;pts.append((x,y));y-=fg;pts.append((x,y));dx=-dx
-            x+=(s-avail)*dx;pts.append((x,y))
+        left = s
+        while left > 0.05:
+            avail = (x_max - x) if dx > 0 else (x - x_min)
+            avail = max(avail, 0.1)
+            step = min(left, avail)
+            x += step * dx
+            pts.append((x, y))
+            left -= step
+            if left > 0.05:
+                y -= fg; pts.append((x, y)); dx = -dx
     return pts
 
 def _draw_trace(ax,pts,w,color=CU,z=3):
@@ -307,25 +318,47 @@ def main():
 
     # ── Compute board sizes ──────────────────────────────────────────
     max_stub_mm=float(np.max(sl))*1e3
-    CH_HPF=max_stub_mm+1.5; CH_BPF=2.0
+    CH_HPF=max_stub_mm+1.5
 
     for res in all_results:
         longest=max(hpf_total, res['t1'], res['t2'])
-        nf=1; tw=longest+2*EDGE_PAD
-        while tw>40: nf+=1; tw=longest/nf+2*EDGE_PAD
-        bw=float(np.ceil(tw))
-        bh=float(np.ceil(EDGE_PAD+CH_HPF+PAD_PITCH+CH_BPF+nf*FOLD_GAP+PAD_PITCH+CH_BPF+nf*FOLD_GAP+EDGE_PAD))
-        bh=max(bh,8)
+        usable_target = 15.0
+        nf = max(1, int(np.ceil(longest / usable_target)))
+        bw = float(np.ceil(longest / nf + 2*EDGE_PAD))
+        bw = max(bw, 10)
+
+        fgap = FOLD_GAP
+        def ch_h(trace_mm):
+            nf_t = max(1, int(np.ceil(trace_mm / (bw - 2*EDGE_PAD))))
+            return 0.5 + nf_t * fgap
+        ch_b1 = ch_h(res['t1'])
+        ch_b2 = ch_h(res['t2'])
+        ch_hpf = max(CH_HPF, ch_h(hpf_total))
+
+        bh = float(np.ceil(EDGE_PAD + ch_hpf + PAD_PITCH + ch_b1 + PAD_PITCH + ch_b2 + EDGE_PAD))
+        bh = max(bh, 8)
         res['bw']=bw; res['bh']=bh; res['nf']=nf
 
     # ── Generate per-variant copper artwork + response ───────────────
     for res in all_results:
         BW,BH=res['bw'],res['bh']
-        y_hpf=BH-EDGE_PAD-0.5; y_b1=y_hpf-CH_HPF-PAD_PITCH+0.5; y_b2=y_b1-CH_BPF-res['nf']*FOLD_GAP-PAD_PITCH
+        longest=max(hpf_total,res['t1'],res['t2'])
+        usable=BW-2*EDGE_PAD
+
+        def _ch_h(trace_mm):
+            nf_t=max(1,int(np.ceil(trace_mm/usable)))
+            return 0.5+nf_t*FOLD_GAP
+        ch_hpf_=max(CH_HPF,_ch_h(hpf_total))
+        ch_b1_=_ch_h(res['t1']); ch_b2_=_ch_h(res['t2'])
+
+        y_hpf=BH-EDGE_PAD-0.5
+        y_b1=y_hpf-ch_hpf_-PAD_PITCH+0.5
+        y_b2=y_b1-ch_b1_-PAD_PITCH
 
         hpf_pts=_meander_pts(EDGE_PAD,y_hpf,hpf_segs,BW)
-        b1_segs=[res['t1']/5]*5 if 'Coupled' in res['name'] or 'Hairpin' in res['name'] else [res['t1']/10]*10
-        b2_segs=[res['t2']/5]*5 if 'Coupled' in res['name'] or 'Hairpin' in res['name'] else [res['t2']/10]*10
+        n_seg = 5 if 'Coupled' in res['name'] or 'Hairpin' in res['name'] else 10
+        b1_segs=[res['t1']/n_seg]*n_seg
+        b2_segs=[res['t2']/n_seg]*n_seg
         bpf1_pts=_meander_pts(EDGE_PAD,y_b1,b1_segs,BW)
         bpf2_pts=_meander_pts(EDGE_PAD,y_b2,b2_segs,BW)
 
@@ -386,14 +419,15 @@ def main():
         fn=f"board_option_{tag}.png";fig.savefig(fn,dpi=200);plt.close(fig);generated.append(fn)
 
     # ── Comparison plot ──────────────────────────────────────────────
+    s21h_np=np.array(s21h); s11h_np=np.array(s11h)
     fig,axes=plt.subplots(3,3,figsize=(18,14))
     fig.suptitle("Board Option Comparison — Frequency Response",fontsize=14,fontweight="bold")
     row_labels=["HPF fc=2.5GHz","BPF1 2.5-3.75GHz","BPF2 3.75-5.0GHz"]
     for ci,res in enumerate(all_results):
         for ri,(s21,s11,vl,title) in enumerate([
-            (s21h,s11h,[2.5],row_labels[0]),
-            (res['s21b1'],res['s11b1'],[2.5,3.75],row_labels[1]),
-            (res['s21b2'],res['s11b2'],[3.75,5.0],row_labels[2]),
+            (s21h_np,s11h_np,[2.5],row_labels[0]),
+            (np.array(res['s21b1']),np.array(res['s11b1']),[2.5,3.75],row_labels[1]),
+            (np.array(res['s21b2']),np.array(res['s11b2']),[3.75,5.0],row_labels[2]),
         ]):
             ax=axes[ri,ci]
             ax.plot(fg,db(s21),"b",lw=1.5,label="|S21|")
@@ -412,14 +446,14 @@ def main():
     print(f"  {'Option':<25s} {'Size':>10s} {'Area':>8s} {'BPF1 IL':>10s} {'BPF2 IL':>10s}")
     print("  "+"-"*63)
     for res in all_results:
-        s21b1d=db(res['s21b1']);s21b2d=db(res['s21b2'])
+        s21b1d=db(np.array(res['s21b1']));s21b2d=db(np.array(res['s21b2']))
         pb1=(fg>=2.5)&(fg<=3.75);pb2=(fg>=3.75)&(fg<=5.0)
         il1=f"{float(-np.max(s21b1d[pb1])):.1f}-{float(-np.min(s21b1d[pb1])):.1f}"
         il2=f"{float(-np.max(s21b2d[pb2])):.1f}-{float(-np.min(s21b2d[pb2])):.1f}"
         sz_str=f"{res['bw']:.0f}×{res['bh']:.0f}mm"
         area=f"{res['bw']*res['bh']:.0f}mm²"
         print(f"  {res['name']:<25s} {sz_str:>10s} {area:>8s} {il1:>10s} {il2:>10s}")
-    hpf_db=db(s21h);pb_h=(fg>=2.5)&(fg<=5.5)
+    hpf_db=db(s21h_np);pb_h=(fg>=2.5)&(fg<=5.5)
     print(f"\n  HPF (shared): IL {float(-np.max(hpf_db[pb_h])):.1f}-{float(-np.min(hpf_db[pb_h])):.1f} dB")
 
     print("\n"+"="*64)
