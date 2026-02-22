@@ -386,6 +386,25 @@ def _draw_gnd_pour(ax, bw, bh, voids=None):
         for (x, y, w, h) in voids:
             ax.add_patch(Rectangle((x, y), w, h, fc=SUBSTRATE, ec="#555", lw=0.2, zorder=2))
 
+def _trace_voids(pts, clearance=0.6):
+    """Generate rectangular void cutouts along a trace path."""
+    voids = []
+    for i in range(len(pts) - 1):
+        x1, y1 = pts[i]; x2, y2 = pts[i + 1]
+        xlo = min(x1, x2) - clearance / 2
+        ylo = min(y1, y2) - clearance / 2
+        w = abs(x2 - x1) + clearance
+        h = abs(y2 - y1) + clearance
+        voids.append((xlo, ylo, max(w, clearance), max(h, clearance)))
+    return voids
+
+def _trace_excl(pts, radius=1.5):
+    """Generate via fence exclusion zones along a trace path."""
+    excl = []
+    for p in pts:
+        excl.append((p[0], p[1], radius))
+    return excl
+
 def _draw_via_fence(ax, bw, bh, excl):
     def ok(x, y):
         for ex, ey, er in excl:
@@ -673,32 +692,43 @@ def main():
         cx,cy=cap_posX[k]; ps=mim_padsX[k]
         ax.add_patch(Rectangle((cx-ps/2,cy-ps/2),ps,ps,fc="#e8d080",ec=CU_DARK,lw=0.4,zorder=4))
     _padsX(ax,"H"); _draw_via_fence(ax,bw3,bh3,exclX)
-    # L2 — cross-coupled resonators (NOT just ground)
-    ax = _layer_ax(fig,(2,3,2),"L2 Cross-coupled resonators",bw3,bh3)
-    _draw_gnd_pour(ax,bw3,bh3,gnd_voidsX)
-    _draw_trace(ax, _meander_pts(EDGE_PAD+2,y_b1X+0.3,[tX1*0.6/5]*5,bw3), 0.3, color="#e74c3c",z=4)
-    _draw_via_fence(ax,bw3,bh3,exclX); _padsX(ax)
+    # L2 — cross-coupled resonators etched FROM ground pour (stripline)
+    xc_l2_pts = _meander_pts(EDGE_PAD+2, y_b1X+0.3, [tX1*0.6/5]*5, bw3)
+    ax = _layer_ax(fig,(2,3,2),"L2 XC resonators (in ground)",bw3,bh3)
+    l2_voids = list(gnd_voidsX) + _trace_voids(xc_l2_pts)
+    _draw_gnd_pour(ax,bw3,bh3,l2_voids)
+    _draw_trace(ax, xc_l2_pts, 0.3, color=CU, z=4)
+    _draw_via_fence(ax,bw3,bh3,exclX + _trace_excl(xc_l2_pts)); _padsX(ax)
+
     # L3 BPF1
     ax = _layer_ax(fig,(2,3,3),f"L3 BPF1 primary ({tX1:.0f}mm)",bw3,bh3)
     _draw_trace(ax,b1ptsX,SL_W50_MM,color="#3498db")
     _draw_via(ax,EDGE_PAD,y_b1X); _draw_via(ax,bw3-EDGE_PAD,y_b1X)
-    _padsX(ax,"1"); _draw_via_fence(ax,bw3,bh3,exclX)
-    # L4 — shared cross-coupled (NOT just ground)
-    ax = _layer_ax(fig,(2,3,4),"L4 Shared cross-coupling layer",bw3,bh3)
-    _draw_gnd_pour(ax,bw3,bh3,gnd_voidsX)
-    _draw_trace(ax, _meander_pts(EDGE_PAD+1,y_b1X-0.3,[tX1*0.4/4]*4,bw3), 0.3, color="#e74c3c",z=4)
-    _draw_trace(ax, _meander_pts(EDGE_PAD+1,y_b2X+0.3,[tX2*0.4/4]*4,bw3), 0.3, color="#e74c3c",z=4)
-    _draw_via_fence(ax,bw3,bh3,exclX); _padsX(ax)
+    _padsX(ax,"1"); _draw_via_fence(ax,bw3,bh3,exclX + _trace_excl(b1ptsX))
+
+    # L4 — shared cross-coupling: traces etched from ground pour
+    xc_l4a_pts = _meander_pts(EDGE_PAD+1, y_b1X-0.3, [tX1*0.4/4]*4, bw3)
+    xc_l4b_pts = _meander_pts(EDGE_PAD+1, y_b2X+0.3, [tX2*0.4/4]*4, bw3)
+    ax = _layer_ax(fig,(2,3,4),"L4 Shared XC (in ground)",bw3,bh3)
+    l4_voids = list(gnd_voidsX) + _trace_voids(xc_l4a_pts) + _trace_voids(xc_l4b_pts)
+    _draw_gnd_pour(ax,bw3,bh3,l4_voids)
+    _draw_trace(ax, xc_l4a_pts, 0.3, color=CU, z=4)
+    _draw_trace(ax, xc_l4b_pts, 0.3, color=CU, z=4)
+    _draw_via_fence(ax,bw3,bh3,exclX + _trace_excl(xc_l4a_pts) + _trace_excl(xc_l4b_pts)); _padsX(ax)
+
     # L5 BPF2
     ax = _layer_ax(fig,(2,3,5),f"L5 BPF2 primary ({tX2:.0f}mm)",bw3,bh3)
     _draw_trace(ax,b2ptsX,SL_W50_MM,color="#9b59b6")
     _draw_via(ax,EDGE_PAD,y_b2X); _draw_via(ax,bw3-EDGE_PAD,y_b2X)
-    _padsX(ax,"2"); _draw_via_fence(ax,bw3,bh3,exclX)
-    # L6 — cross-coupled resonators
-    ax = _layer_ax(fig,(2,3,6),"L6 Cross-coupled resonators",bw3,bh3)
-    _draw_gnd_pour(ax,bw3,bh3,gnd_voidsX)
-    _draw_trace(ax, _meander_pts(EDGE_PAD+2,y_b2X-0.3,[tX2*0.5/4]*4,bw3), 0.3, color="#e74c3c",z=4)
-    _draw_via_fence(ax,bw3,bh3,exclX); _padsX(ax)
+    _padsX(ax,"2"); _draw_via_fence(ax,bw3,bh3,exclX + _trace_excl(b2ptsX))
+
+    # L6 — cross-coupled resonators etched from ground pour
+    xc_l6_pts = _meander_pts(EDGE_PAD+2, y_b2X-0.3, [tX2*0.5/4]*4, bw3)
+    ax = _layer_ax(fig,(2,3,6),"L6 XC resonators (in ground)",bw3,bh3)
+    l6_voids = list(gnd_voidsX) + _trace_voids(xc_l6_pts)
+    _draw_gnd_pour(ax,bw3,bh3,l6_voids)
+    _draw_trace(ax, xc_l6_pts, 0.3, color=CU, z=4)
+    _draw_via_fence(ax,bw3,bh3,exclX + _trace_excl(xc_l6_pts)); _padsX(ax)
     fig.tight_layout(rect=[0,0,1,0.95])
     fig.savefig("board_crosscoupled_copper.png",dpi=200); plt.close(fig)
     generated.append("board_crosscoupled_copper.png")
@@ -821,6 +851,59 @@ def main():
             fname = None
         plt.close(fig_g)
         return fname
+
+    # ── Group delay plots ─────────────────────────────────────────────
+    def _group_delay_ns(s21_arr, f_hz_arr):
+        """Group delay = -d(phase)/d(omega) in nanoseconds."""
+        phase = np.unwrap(np.angle(s21_arr))
+        omega = 2 * np.pi * f_hz_arr
+        d_phase = np.gradient(phase, omega)
+        return -d_phase * 1e9
+
+    fig_gd, axes_gd = plt.subplots(1, 3, figsize=(18, 5))
+    fig_gd.suptitle("Group Delay — All Boards", fontsize=14, fontweight="bold")
+
+    boards_gd = [
+        ("Board A (N=5)", s21b1_std, s21b2_std, "b"),
+        ("Board B (N=9)", s21b1_stp, s21b2_stp, "r"),
+        ("Board C (XC 3D)", s21Xb1, s21Xb2, "g"),
+    ]
+
+    # HPF group delay (shared)
+    ax = axes_gd[0]
+    gd_hpf = _group_delay_ns(s21h_np, np.array(fp))
+    ax.plot(f_ghz, gd_hpf, "k", lw=1.5)
+    ax.set_title("HPF (shared)"); ax.set_xlabel("GHz"); ax.set_ylabel("Group delay [ns]")
+    ax.set_xlim(1, 6); ax.set_ylim(0, max(np.max(gd_hpf[(f_ghz>2)&(f_ghz<6)]), 1) * 1.5)
+    ax.axvline(2.5, color="gray", ls=":", lw=0.8); ax.grid(True, alpha=0.3)
+
+    # BPF1 group delay
+    ax = axes_gd[1]
+    for label, s21b1, _, col in boards_gd:
+        gd = _group_delay_ns(s21b1, np.array(fp))
+        mask = (f_ghz >= 2.0) & (f_ghz <= 4.5)
+        gd_clip = np.clip(gd, 0, np.percentile(gd[mask], 95) * 2)
+        ax.plot(f_ghz, gd_clip, col, lw=1.2, label=label)
+    ax.set_title("BPF1 2.5-3.75 GHz"); ax.set_xlabel("GHz"); ax.set_ylabel("Group delay [ns]")
+    ax.set_xlim(2, 4.5); ax.legend(fontsize=8)
+    ax.axvline(2.5, color="gray", ls=":", lw=0.8); ax.axvline(3.75, color="gray", ls=":", lw=0.8)
+    ax.grid(True, alpha=0.3)
+
+    # BPF2 group delay
+    ax = axes_gd[2]
+    for label, _, s21b2, col in boards_gd:
+        gd = _group_delay_ns(s21b2, np.array(fp))
+        mask = (f_ghz >= 3.0) & (f_ghz <= 5.5)
+        gd_clip = np.clip(gd, 0, np.percentile(gd[mask], 95) * 2)
+        ax.plot(f_ghz, gd_clip, col, lw=1.2, label=label)
+    ax.set_title("BPF2 3.75-5.0 GHz"); ax.set_xlabel("GHz"); ax.set_ylabel("Group delay [ns]")
+    ax.set_xlim(3, 5.5); ax.legend(fontsize=8)
+    ax.axvline(3.75, color="gray", ls=":", lw=0.8); ax.axvline(5.0, color="gray", ls=":", lw=0.8)
+    ax.grid(True, alpha=0.3)
+
+    fig_gd.tight_layout()
+    fig_gd.savefig("board_group_delay.png", dpi=200); plt.close(fig_gd)
+    generated.append("board_group_delay.png")
 
     print("\n  Generating 2D wave propagation GIFs...")
     gf = _wave_gif_2d(b1pts1, s21b1_std, "Board A: Standard BPF1 (N=5)",
