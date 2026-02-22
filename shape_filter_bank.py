@@ -219,6 +219,75 @@ def _bpf_trace(p, n):
     ll, sl, _, _ = _unpack(p, bnd)
     return float(jnp.sum(ll) + jnp.sum(sl)) * 1e3
 
+# ═══════════════════════════════════════════════════════════════════════
+#  BPF TOPOLOGY X: Cross-coupled 3D multilayer
+#  All 6 layers carry active resonant structures:
+#    Primary resonators on L3/L5 (same as before)
+#    Cross-coupled resonators on L2/L4 (broadside coupling)
+#    Cross-coupling between non-adjacent resonators creates
+#    finite transmission zeros → elliptic-like response
+# ═══════════════════════════════════════════════════════════════════════
+def _bpfX_pos_bounds(n):
+    """Positive-valued bounds (log-space transform)."""
+    return [
+        (n, 1e-3, 10e-3),    # primary line lengths
+        (n, 1e-3, 10e-3),    # primary stub lengths
+        (n, 25., 120.),      # primary stub impedances
+        (n + 1, 0.01, 2.0),  # J-inverters
+        (n, 0.5e-3, 8e-3),   # cross-coupled resonator lengths
+    ]
+
+def _bpfX_n_xc(n): return n
+
+def _bpfX_init(fc, fbw, n=5, g=None):
+    if g is None: g = CHEBY_G5
+    J = [float(np.sqrt(np.pi * fbw / (2 * g[0] * g[1])))]
+    for i in range(1, n):
+        J.append(float(np.pi * fbw / (2 * np.sqrt(g[i] * g[i + 1]))))
+    J.append(float(np.sqrt(np.pi * fbw / (2 * g[n] * g[n + 1]))))
+    J = [max(min(j, 1.99), 0.011) for j in J]
+    lam8 = min(C0 / (fc * np.sqrt(ER_SL)) / 8, 8e-3)
+    lam4 = min(C0 / (fc * np.sqrt(ER_SL)) / 4, 7e-3)
+    pos_vals = [lam8]*n + [lam8*1.2]*n + [70.]*n + J + [lam4]*n
+    pos_packed = _pack(pos_vals, _bpfX_pos_bounds(n))
+    xc_raw = jnp.zeros(n)
+    return jnp.concatenate([pos_packed, xc_raw])
+
+def _make_bpfX_at_f(n):
+    bnd = _bpfX_pos_bounds(n)
+    n_pos = sum(nn for nn, _, _ in bnd)
+    def _at_f(p, f):
+        pos_parts = _unpack(p[:n_pos], bnd)
+        ll, sl, sz, jn, xrl = pos_parts
+        xc = jnp.tanh(p[n_pos:]) * 1.5
+        J = jn / Z_REF
+        M0 = ajinv(J[0])
+        def body(M, x):
+            line_l, stub_l, stub_z, j_next, xr_l, xc_k = x
+            gl = _glsl(f, line_l)
+            gs = (TAND_SL * jnp.pi * f * jnp.sqrt(ER_SL) / C0
+                  + 1j * 2 * jnp.pi * f * jnp.sqrt(ER_SL) / C0) * stub_l
+            Y_stub = 1j * jnp.tan(jnp.imag(gs)) / stub_z
+
+            # Cross-coupled resonator on adjacent layer (broadside)
+            f_xr = C0 / (2 * xr_l * jnp.sqrt(ER_SL) + 1e-10)
+            omega = 2 * jnp.pi * f
+            omega_xr = 2 * jnp.pi * f_xr
+            Cc_xr = EPS0 * ER_SL * 1e-3 * xr_l / H_SL * 0.05
+            Y_xc = xc_k * 1j * omega * Cc_xr * omega_xr**2 / (
+                omega_xr**2 - omega**2 + 1j * omega * omega_xr / 15. + 1e-20)
+
+            return M @ atl(Z_REF, gl) @ ash(Y_stub + Y_xc) @ ajinv(j_next), None
+        Mf, _ = jax.lax.scan(body, M0, (ll, sl, sz, J[1:], xrl, xc))
+        return atos(Mf)
+    return _at_f
+
+def _bpfX_trace(p, n):
+    bnd = _bpfX_pos_bounds(n)
+    parts = _unpack(p[:sum(nn for nn,_,_ in bnd)], bnd)
+    return float(jnp.sum(parts[0]) + jnp.sum(parts[1])) * 1e3
+
+
 def _bpf_loss(fl, fh, batch_fn, guard=0.3):
     bw = fh - fl
     def loss_fn(p, freqs):
@@ -267,6 +336,19 @@ def _opt(loss_fn, init_fn, freqs, n_r=3, n_steps=2500, lr=5e-3):
 # ═══════════════════════════════════════════════════════════════════════
 CU = "#c8882e"; CU_DARK = "#a06820"; SUBSTRATE = "#1a1a2e"
 VIA_C = "#ccb060"; SOLDER = "#d4d4d4"
+
+def _x_at_pathlen(pts, d_mm):
+    """Find (x,y) at distance d_mm along a polyline path."""
+    cum = 0
+    for i in range(len(pts) - 1):
+        seg = np.sqrt((pts[i+1][0]-pts[i][0])**2 + (pts[i+1][1]-pts[i][1])**2)
+        if cum + seg >= d_mm - 0.01:
+            frac = (d_mm - cum) / max(seg, 0.01)
+            frac = min(max(frac, 0), 1)
+            return (pts[i][0] + frac * (pts[i+1][0] - pts[i][0]),
+                    pts[i][1] + frac * (pts[i+1][1] - pts[i][1]))
+        cum += seg
+    return pts[-1]
 
 def _meander_pts(x0, y0, segs, bw):
     """Meander trace from left edge pad to right edge pad."""
@@ -385,18 +467,7 @@ def _design_board(label, prefix, n_bpf, g_bpf, guard, p_hpf, hpf_data,
     # Topology: Stub0 — ll[0] — Cap0 — ll[1] — Stub1 — ll[2] — Cap1 — ll[3] — Stub2
     # Stubs at cumulative: 0, ll[0]+ll[1], ll[0]+ll[1]+ll[2]+ll[3]
     # Caps at cumulative: ll[0], ll[0]+ll[1]+ll[2]
-    def _x_at_pathlen(pts, d_mm):
-        """Find (x,y) at distance d_mm along a polyline path."""
-        cum = 0
-        for i in range(len(pts) - 1):
-            seg = np.sqrt((pts[i+1][0]-pts[i][0])**2 + (pts[i+1][1]-pts[i][1])**2)
-            if cum + seg >= d_mm - 0.01:
-                frac = (d_mm - cum) / max(seg, 0.01)
-                frac = min(max(frac, 0), 1)
-                return (pts[i][0] + frac * (pts[i+1][0] - pts[i][0]),
-                        pts[i][1] + frac * (pts[i+1][1] - pts[i][1]))
-            cum += seg
-        return pts[-1]
+    pass  # _x_at_pathlen is at module level
 
     stub_positions = [
         _x_at_pathlen(hpf_pts, 0),
@@ -518,32 +589,163 @@ def main():
         freqs, fp, f_ghz, db, f1l, f1h, f2l, f2h)
     generated.extend(g2)
 
-    # Comparison overlay
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    fig.suptitle("BPF Rolloff Comparison: Standard (N=5) vs Steep (N=9)", fontsize=13, fontweight="bold")
-    for ax, s21_s, s21_st, title, vl in [
-        (axes[0], s21b1_std, s21b1_stp, "BPF1 2.5-3.75 GHz", [2.5, 3.75]),
-        (axes[1], s21b2_std, s21b2_stp, "BPF2 3.75-5.0 GHz", [3.75, 5.0]),
+    # Board 3: Cross-coupled 3D (N=5, all 6 layers active, transmission zeros)
+    fc1_ = (f1l + f1h) / 2; fbw1_ = (f1h - f1l) / fc1_
+    fc2_ = (f2l + f2h) / 2; fbw2_ = (f2h - f2l) / fc2_
+    print("\n" + "=" * 64)
+    print("  Board C: Cross-Coupled 3D Multilayer (N=5, all layers active)")
+    print("=" * 64)
+    bpfX_at_f_5 = _make_bpfX_at_f(5)
+    bpfX_batch_5 = jax.vmap(bpfX_at_f_5, in_axes=(None, 0))
+    lossX1 = _bpf_loss(f1l, f1h, bpfX_batch_5, guard=0.15)
+    print("  BPF1 2.5-3.75 GHz (cross-coupled):")
+    pX1 = _opt(lossX1, lambda: _bpfX_init(fc1_, fbw1_, 5, CHEBY_G5), freqs, n_r=3, n_steps=3000)
+    lossX2 = _bpf_loss(f2l, f2h, bpfX_batch_5, guard=0.15)
+    print("  BPF2 3.75-5.0 GHz (cross-coupled):")
+    pX2 = _opt(lossX2, lambda: _bpfX_init(fc2_, fbw2_, 5, CHEBY_G5), freqs, n_r=3, n_steps=3000)
+    s21Xb1 = np.array(bpfX_batch_5(pX1, fp)[0])
+    s21Xb2 = np.array(bpfX_batch_5(pX2, fp)[0])
+    tX1 = _bpfX_trace(pX1, 5); tX2 = _bpfX_trace(pX2, 5)
+    hpf_total_ = float(np.sum(sl) + np.sum(ll)) * 1e3
+
+    # Board C sizing
+    longestX = max(hpf_total_, tX1, tX2)
+    nfX = max(1, int(np.ceil(longestX / 14.0)))
+    bw3 = float(np.ceil(longestX / nfX + 2 * EDGE_PAD)); bw3 = max(bw3, 10)
+    max_stub_mm_ = float(np.max(sl)) * 1e3
+    CH_HPF_ = max_stub_mm_ + 1.5; uw3 = bw3 - 2 * EDGE_PAD
+    def _ch3(tr): return 0.5 + max(1, int(np.ceil(tr / uw3))) * FOLD_GAP
+    ch_b1X = _ch3(tX1); ch_b2X = _ch3(tX2); ch_hpfX = max(CH_HPF_, _ch3(hpf_total_))
+    bh3 = float(np.ceil(EDGE_PAD + ch_hpfX + PAD_PITCH + ch_b1X + PAD_PITCH + ch_b2X + EDGE_PAD))
+    bh3 = max(bh3, 8)
+
+    print(f"\n  Board C: {bw3:.0f}×{bh3:.0f}mm ({bw3*bh3:.0f}mm²)")
+    for name, s21, vl in [("HPF",s21h_np,[2.5,5.5]),("BPF1",s21Xb1,[2.5,3.75]),("BPF2",s21Xb2,[3.75,5.0])]:
+        s21d = db(s21); pb = (f_ghz>=vl[0])&(f_ghz<=vl[-1])
+        if np.any(pb):
+            print(f"  {name:5s} IL: {float(-np.max(s21d[pb])):.1f} - {float(-np.min(s21d[pb])):.1f} dB")
+
+    # Board C copper artwork
+    y_hpfX = bh3 - EDGE_PAD - 0.5
+    y_b1X = y_hpfX - ch_hpfX - PAD_PITCH + 0.5
+    y_b2X = y_b1X - ch_b1X - PAD_PITCH
+    b1ptsX = _meander_pts(EDGE_PAD, y_b1X, [tX1/10]*10, bw3)
+    b2ptsX = _meander_pts(EDGE_PAD, y_b2X, [tX2/10]*10, bw3)
+    hpf_ptsX = _meander_pts(EDGE_PAD, y_hpfX, [ll[k]*1e3 for k in range(len(ll))], bw3)
+
+    stub_w_mmX = [float(_ms_width(jnp.array(float(sz[k])))) * 1e3 for k in range(3)]
+    mim_padsX = [np.sqrt(float(cp[k]) * H_CORE / (EPS0 * ER_CORE)) * 1e3 for k in range(2)]
+    stub_posX = [
+        _x_at_pathlen(hpf_ptsX, 0),
+        _x_at_pathlen(hpf_ptsX, (ll[0]+ll[1])*1e3),
+        _x_at_pathlen(hpf_ptsX, sum([ll[k]*1e3 for k in range(len(ll))])),
+    ]
+    cap_posX = [
+        _x_at_pathlen(hpf_ptsX, ll[0]*1e3),
+        _x_at_pathlen(hpf_ptsX, (ll[0]+ll[1]+ll[2])*1e3),
+    ]
+
+    padsX = [(0,bh3-1,"G"),(0,y_hpfX,"H"),(0,y_b1X,"1"),(0,y_b2X,"2"),(0,1,"G"),
+             (bw3,bh3-1,"G"),(bw3,y_hpfX,"H"),(bw3,y_b1X,"1"),(bw3,y_b2X,"2"),(bw3,1,"G")]
+    exclX = [(px,py,1.8) for px,py,_ in padsX]
+    gnd_voidsX = [(px-0.4 if px>0 else -0.1,py-0.4,0.8,0.8) for px,py,lb in padsX if lb!="G"]
+    def _padsX(ax,hi=None):
+        for px,py,lb in padsX:
+            _draw_castellated(ax,px,py)
+            if lb!="G":
+                tx=px+(1.2 if px<bw3/2 else -1.2); ha="left" if px<bw3/2 else "right"
+                lbl={"H":"HPF","1":"BPF1","2":"BPF2"}[lb]
+                c="#e74c3c" if hi and lb==hi else "#888"
+                ax.text(tx,py,lbl,fontsize=5,ha=ha,va="center",color=c,
+                        fontweight="bold" if hi and lb==hi else "normal")
+
+    fig = plt.figure(figsize=(21, 14))
+    fig.suptitle(f"Board C: Cross-Coupled 3D — {bw3:.0f}×{bh3:.0f}mm  |  ALL 6 Layers Active",
+                 fontsize=14, fontweight="bold")
+    # L1 HPF
+    ax = _layer_ax(fig,(2,3,1),"L1 HPF + coupled stubs",bw3,bh3)
+    _draw_trace(ax, hpf_ptsX, W50_MM)
+    for k in range(3):
+        sx,sy=stub_posX[k]; se=sy-sl[k]*1e3
+        _draw_trace(ax,[(sx,sy),(sx,se)],stub_w_mmX[k],color="#d4a040")
+        _draw_via(ax,sx,se-0.3)
+    for k in range(2):
+        cx,cy=cap_posX[k]; ps=mim_padsX[k]
+        ax.add_patch(Rectangle((cx-ps/2,cy-ps/2),ps,ps,fc="#e8d080",ec=CU_DARK,lw=0.4,zorder=4))
+    _padsX(ax,"H"); _draw_via_fence(ax,bw3,bh3,exclX)
+    # L2 — cross-coupled resonators (NOT just ground)
+    ax = _layer_ax(fig,(2,3,2),"L2 Cross-coupled resonators",bw3,bh3)
+    _draw_gnd_pour(ax,bw3,bh3,gnd_voidsX)
+    _draw_trace(ax, _meander_pts(EDGE_PAD+2,y_b1X+0.3,[tX1*0.6/5]*5,bw3), 0.3, color="#e74c3c",z=4)
+    _draw_via_fence(ax,bw3,bh3,exclX); _padsX(ax)
+    # L3 BPF1
+    ax = _layer_ax(fig,(2,3,3),f"L3 BPF1 primary ({tX1:.0f}mm)",bw3,bh3)
+    _draw_trace(ax,b1ptsX,SL_W50_MM,color="#3498db")
+    _draw_via(ax,EDGE_PAD,y_b1X); _draw_via(ax,bw3-EDGE_PAD,y_b1X)
+    _padsX(ax,"1"); _draw_via_fence(ax,bw3,bh3,exclX)
+    # L4 — shared cross-coupled (NOT just ground)
+    ax = _layer_ax(fig,(2,3,4),"L4 Shared cross-coupling layer",bw3,bh3)
+    _draw_gnd_pour(ax,bw3,bh3,gnd_voidsX)
+    _draw_trace(ax, _meander_pts(EDGE_PAD+1,y_b1X-0.3,[tX1*0.4/4]*4,bw3), 0.3, color="#e74c3c",z=4)
+    _draw_trace(ax, _meander_pts(EDGE_PAD+1,y_b2X+0.3,[tX2*0.4/4]*4,bw3), 0.3, color="#e74c3c",z=4)
+    _draw_via_fence(ax,bw3,bh3,exclX); _padsX(ax)
+    # L5 BPF2
+    ax = _layer_ax(fig,(2,3,5),f"L5 BPF2 primary ({tX2:.0f}mm)",bw3,bh3)
+    _draw_trace(ax,b2ptsX,SL_W50_MM,color="#9b59b6")
+    _draw_via(ax,EDGE_PAD,y_b2X); _draw_via(ax,bw3-EDGE_PAD,y_b2X)
+    _padsX(ax,"2"); _draw_via_fence(ax,bw3,bh3,exclX)
+    # L6 — cross-coupled resonators
+    ax = _layer_ax(fig,(2,3,6),"L6 Cross-coupled resonators",bw3,bh3)
+    _draw_gnd_pour(ax,bw3,bh3,gnd_voidsX)
+    _draw_trace(ax, _meander_pts(EDGE_PAD+2,y_b2X-0.3,[tX2*0.5/4]*4,bw3), 0.3, color="#e74c3c",z=4)
+    _draw_via_fence(ax,bw3,bh3,exclX); _padsX(ax)
+    fig.tight_layout(rect=[0,0,1,0.95])
+    fig.savefig("board_crosscoupled_copper.png",dpi=200); plt.close(fig)
+    generated.append("board_crosscoupled_copper.png")
+
+    # Board C response
+    fig,axes=plt.subplots(1,3,figsize=(18,5))
+    fig.suptitle(f"Board C: Cross-Coupled 3D — {bw3:.0f}×{bh3:.0f}mm",fontsize=14,fontweight="bold")
+    for ax,s21,s11,title,vl in [
+        (axes[0],s21h_np,s11h_np,"HPF (L1)",[2.5]),
+        (axes[1],s21Xb1,np.zeros_like(s21Xb1),f"BPF1 N=5 XC (L3+L2+L4)",[2.5,3.75]),
+        (axes[2],s21Xb2,np.zeros_like(s21Xb2),f"BPF2 N=5 XC (L5+L4+L6)",[3.75,5.0]),
     ]:
-        ax.plot(f_ghz, db(s21_s), "b", lw=1.5, label=f"N=5 ({bw1:.0f}×{bh1:.0f}mm)")
-        ax.plot(f_ghz, db(s21_st), "r", lw=1.5, label=f"N=9 steep ({bw2:.0f}×{bh2:.0f}mm)")
+        ax.plot(f_ghz,db(s21),"b",lw=1.5,label="|S21|")
+        ax.set_title(title,fontsize=10); ax.set_xlabel("GHz"); ax.set_ylabel("dB")
+        ax.set_ylim(-50,3); ax.legend(fontsize=8); ax.grid(True,alpha=0.3)
+        for fv in vl: ax.axvline(fv,color="gray",ls=":",lw=0.8)
+    fig.tight_layout()
+    fig.savefig("board_crosscoupled_response.png",dpi=200); plt.close(fig)
+    generated.append("board_crosscoupled_response.png")
+
+    # Comparison overlay (all 3 boards)
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig.suptitle("BPF Rolloff: Standard vs Steep vs Cross-Coupled 3D", fontsize=13, fontweight="bold")
+    for ax, s21s, s21st, s21xc, title, vl in [
+        (axes[0], s21b1_std, s21b1_stp, s21Xb1, "BPF1 2.5-3.75 GHz", [2.5, 3.75]),
+        (axes[1], s21b2_std, s21b2_stp, s21Xb2, "BPF2 3.75-5.0 GHz", [3.75, 5.0]),
+    ]:
+        ax.plot(f_ghz, db(s21s), "b", lw=1.5, label=f"A: N=5 ({bw1:.0f}×{bh1:.0f}mm)")
+        ax.plot(f_ghz, db(s21st), "r", lw=1.5, label=f"B: N=9 steep ({bw2:.0f}×{bh2:.0f}mm)")
+        ax.plot(f_ghz, db(s21xc), "g", lw=1.5, label=f"C: N=5 XC 3D ({bw3:.0f}×{bh3:.0f}mm)")
         ax.set_title(title); ax.set_xlabel("GHz"); ax.set_ylabel("|S21| [dB]")
-        ax.set_ylim(-50, 3); ax.legend(fontsize=9); ax.grid(True, alpha=0.3)
+        ax.set_ylim(-50, 3); ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
         for fv in vl: ax.axvline(fv, color="gray", ls=":", lw=0.8)
     fig.tight_layout()
     fig.savefig("board_rolloff_comparison.png", dpi=200); plt.close(fig)
     generated.append("board_rolloff_comparison.png")
 
-    # Stackup
-    fig_s, ax_s = plt.subplots(figsize=(10, 5))
-    ax_s.set_title("6-Layer Stackup", fontsize=13, fontweight="bold")
+    # Stackup (Board C version — all layers active)
+    fig_s, ax_s = plt.subplots(figsize=(12, 5))
+    ax_s.set_title("6-Layer Stackup — Board C: All Layers Active", fontsize=13, fontweight="bold")
     stack = [
         ("L1 HPF signal", 35e-6, "#e67e22"), ("RO3010 er=10.2", H_CORE, "#f5e6d3"),
-        ("L2 Ground", 35e-6, "#27ae60"), ("RO4450F er=3.52", H_SL, "#ecf0f1"),
-        ("L3 BPF1 stripline", 18e-6, "#3498db"), ("RO4450F er=3.52", H_SL, "#ecf0f1"),
-        ("L4 Ground", 35e-6, "#27ae60"), ("RO4450F er=3.52", H_SL, "#ecf0f1"),
-        ("L5 BPF2 stripline", 18e-6, "#9b59b6"), ("RO4450F er=3.52", H_SL, "#ecf0f1"),
-        ("L6 Ground", 35e-6, "#27ae60"),
+        ("L2 Cross-coupled res. + GND", 35e-6, "#c0392b"), ("RO4450F er=3.52", H_SL, "#ecf0f1"),
+        ("L3 BPF1 primary res.", 18e-6, "#3498db"), ("RO4450F er=3.52", H_SL, "#ecf0f1"),
+        ("L4 Shared XC + GND", 35e-6, "#c0392b"), ("RO4450F er=3.52", H_SL, "#ecf0f1"),
+        ("L5 BPF2 primary res.", 18e-6, "#9b59b6"), ("RO4450F er=3.52", H_SL, "#ecf0f1"),
+        ("L6 Cross-coupled res. + GND", 35e-6, "#c0392b"),
     ]
     y_s = 0
     for label_s, t, c in reversed(stack):
@@ -621,11 +823,14 @@ def main():
         return fname
 
     print("\n  Generating 2D wave propagation GIFs...")
-    gf = _wave_gif_2d(b1pts1, s21b1_std, "Standard BPF1 (N=5)",
+    gf = _wave_gif_2d(b1pts1, s21b1_std, "Board A: Standard BPF1 (N=5)",
                        "board_standard_wave.gif", 3.1e9, 1.5e9, bw1, bh1)
     if gf: generated.append(gf)
-    gf = _wave_gif_2d(b1pts2, s21b1_stp, "Steep BPF1 (N=9)",
+    gf = _wave_gif_2d(b1pts2, s21b1_stp, "Board B: Steep BPF1 (N=9)",
                        "board_steep_wave.gif", 3.1e9, 1.5e9, bw2, bh2)
+    if gf: generated.append(gf)
+    gf = _wave_gif_2d(b1ptsX, s21Xb1, "Board C: Cross-Coupled BPF1 (N=5 XC)",
+                       "board_crosscoupled_wave.gif", 3.1e9, 1.5e9, bw3, bh3)
     if gf: generated.append(gf)
 
     print("\n" + "=" * 64)
